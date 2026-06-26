@@ -1,0 +1,64 @@
+逐顶点和逐片元渲染的核心区别，在于数据在哪个阶段被插值，而插值的过程由 GPU 的固定硬件单元（光栅化器）自动完成
+渲染流程
+[模型数据]  →  [顶点着色器输入]  →  [顶点着色器]  →  [顶点着色器输出/片元着色器输入]  →  [光栅化器插值]  →  [片元着色器]  →  [输出合并]
+
+
+
+
+
+// ========== 逐顶点光照（Gouraud Shading） ==========
+// 在顶点着色器里算光照，结果传递出去被插值
+Varyings vert(Attributes IN)
+{
+    Varyings OUT;
+    OUT.positionCS = UnityObjectToClipPos(IN.positionOS);
+    
+    // 在顶点着色器里计算光照（只算3次，三角形只有3个顶点）
+    float3 N = normalize(UnityObjectToWorldNormal(IN.normalOS));
+    float3 L = normalize(_WorldSpaceLightPos0.xyz);
+    OUT.lighting = max(0, dot(N, L)) * _LightColor0; // 结果被线性插值！
+    
+    return OUT;
+}
+
+half4 frag(Varyings IN) : SV_Target
+{
+    // 直接使用插值后的光照结果
+    return half4(IN.lighting, 1); 
+    // 高光会在三角形内部被"抹平"，丢失细节
+}
+
+
+
+
+
+
+
+
+
+
+// ========== 逐片元光照（Phong Shading） ==========
+// 在顶点着色器里只传递几何数据，在片元着色器里算光照
+Varyings vert(Attributes IN)
+{
+    Varyings OUT;
+    OUT.positionCS = UnityObjectToClipPos(IN.positionOS);
+    OUT.normalWS = UnityObjectToWorldNormal(IN.normalOS);  // 只传递数据
+    OUT.worldPos = mul(unity_ObjectToWorld, IN.positionOS).xyz;
+    return OUT;
+}
+
+half4 frag(Varyings IN) : SV_Target
+{
+    // 对每个像素重新计算光照（可能有几十万个像素）
+    float3 N = normalize(IN.normalWS);  // 必须重新归一化！插值后长度≠1
+    float3 L = normalize(_WorldSpaceLightPos0.xyz);
+    float3 V = normalize(_WorldSpaceCameraPos - IN.worldPos);
+    float3 H = normalize(L + V);
+    
+    float diffuse = max(0, dot(N, L));
+    float specular = pow(max(0, dot(N, H)), 32);
+    
+    return half4((diffuse + specular) * _LightColor0, 1);
+    // 高光可以精确到像素级别
+}
