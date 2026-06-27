@@ -14,6 +14,19 @@ Shader "NPR/Niluo/Body"
     {
 //定义渲染标签 (/渲染类型/渲染管线/渲染队列
         Tags{"renderType" ="Opaque" "renderPopeline"="UniversalPipeline" "Queue"="Geometry"}
+
+//定义常量缓冲区（Uniform Buffer Object）/传递数据给GPU
+//这样做能让 CPU 将材质数据一次性推送到 GPU 缓存中，多个使用相同 Shader 的模型只需切换索引，不再重复 SetPass Call，提升性能
+//CBUFFER 只能放固定大小的数值类型（float/int/half 及其向量/矩阵），纹理、采样器、缓冲区对象都不能放
+//CBUFFER块必须放在Pass块内但是可以放在HLSLINCLUDE中，这个块的内容会被所有Pass块共享
+        HLSLINCLUDE
+
+            CBUFFER_START(UnityPerMaterial)
+
+            CBUFFER_END
+            
+        ENDHLSL
+
 //通道/具体的渲染逻辑
         pass
         {
@@ -28,12 +41,7 @@ Shader "NPR/Niluo/Body"
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
-//定义常量缓冲区（Uniform Buffer Object）/传递数据给GPU
-//这样做能让 CPU 将材质数据一次性推送到 GPU 缓存中，多个使用相同 Shader 的模型只需切换索引，不再重复 SetPass Call，提升性能
-//CBUFFER 只能放固定大小的数值类型（float/int/half 及其向量/矩阵），纹理、采样器、缓冲区对象都不能放
-            CBUFFER_START(UnityPerMaterial)
 
-            CBUFFER_END
 //顶点属性结构体/顶点着色器输入            
             struct Attributes
             {
