@@ -94,7 +94,7 @@
   重要推论：
     - 每个顶点都有自己的 TBN
     - GPU 插值后，每个像素都有自己的 TBN
-    - TBN常定义在ws下，ts下的TBN无意义，其变体即TBN逆矩阵可以将lightDir和viewDir从ws转化到ts下 
+    - TBN常定义在ws下，ts下的TBN无意义，ws下TBN（正交矩阵）其逆矩阵（即转置矩阵，shader中表现为行向量，正常是列向量）可以将LightDir和ViewDir从ws转化为ts
 
 ─────────────────────────────
 2-2 为什么法线贴图存储切线空间法线（而不是世界空间法线）
