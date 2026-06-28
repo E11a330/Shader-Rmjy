@@ -1,0 +1,734 @@
+================================================================================
+     TBN 矩阵 · 法线贴图 · 施密特正交化 ——— 完整整合学习笔记
+================================================================================
+整理时间：2026-06-29
+来源整合：TBN_NormalMap_GramSchmidt_笔记.txt ＋ 切线空间_TBN_施密特正交化.txt
+适用平台：Unity URP / HDRP Shader（HLSL），通用于 OpenGL / DirectX / Vulkan 体系
+================================================================================
+
+
+【目录】
+  一、为什么需要法线贴图
+  二、坐标空间体系与 TBN 三轴
+      2-1 切线空间的定义与直觉理解
+      2-2 为什么法线贴图存储切线空间法线（而不是世界空间法线）
+      2-3 为什么法线贴图通常呈蓝紫色
+  三、TBN 矩阵的构建（逐顶点）
+      3-1 TBN 矩阵的数学结构
+      3-2 GPU 完整流程概览
+  四、为什么需要施密特正交化（Gram-Schmidt）
+      4-1 导致非正交的原因（综合两份笔记）
+      4-2 非正交 TBN 会造成哪些视觉错误
+  五、施密特正交化原理与实现
+      5-1 数学原理
+      5-2 逐顶点正交化 vs 逐像素正交化
+      5-3 为什么不能完全信任模型导出的 TBN（插值破坏正交性）
+  六、法线贴图的采样与解码
+  七、切线空间法线 → 世界空间法线（TBN 矩阵的使用）
+  八、用于光照计算
+  九、完整代码注释示例（URP HLSL）
+  十、常见错误与注意点
+  十一、常用公式速查
+  十二、知识关系图（文字版）
+  十三、一句话总结 & 记忆链路
+
+
+================================================================================
+一、为什么需要法线贴图
+================================================================================
+
+【背景问题】
+  一个高精度三维模型可能有数百万个三角面，GPU 每帧实时渲染这些面的代价
+  极高。游戏中使用的通常是 低模（Low-Poly）。
+
+  但低模表面很平滑，缺少细节——表面法线（Normal）在每个三角面内几乎不变，
+  导致光照反应"太平"，凹凸感缺失。
+
+【解决思路】
+  把高精度模型的法线信息"烘焙"进一张贴图，让低模在每个像素级别都拥有
+  不同的法线方向，从而模拟光照细节。这张贴图就叫 法线贴图（Normal Map）。
+
+【视觉效果】
+  低模 + 法线贴图 ≈ 高模的光照效果
+  但几何体（轮廓线、顶点数）不变，性能开销小很多。
+
+【法线贴图存储的是什么】
+  法线贴图每个像素存储的是"该像素点的法线方向"，
+  但不是世界空间下的绝对方向，而是 切线空间（Tangent Space）下的相对偏移。
+  这样同一张法线贴图可以复用到模型的不同位置，甚至不同模型。
+
+【完整流程（一句话概述）】
+  模型法线 → 建立局部坐标系（TBN）→ Normal Map 记录局部法线
+           → TBN 转换到世界空间 → 光照计算
+
+
+================================================================================
+二、坐标空间体系与 TBN 三轴
+================================================================================
+
+─────────────────────────────
+2-1 切线空间的定义与直觉理解
+─────────────────────────────
+
+【切线空间的定义】
+  切线空间是一种依附在模型表面每个顶点上的局部坐标系，由三个正交轴组成：
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  轴名       英文全称      变量名        含义                            │
+  │  T 轴   Tangent         tDirWS       与UV的U方向（横向）对齐           │
+  │  B 轴   Bitangent       bDirWS       与UV的V方向（纵向）对齐，也叫副切线│
+  │  N 轴   Normal          nDirWS       顶点的法线方向（垂直于表面）       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  T、B、N 三轴相互垂直，构成一个标准正交基，称为 TBN 坐标系。
+  三者两两垂直，组成局部 XYZ。
+
+【切线空间的直觉理解】
+  想象你拿着一张便利贴，贴到球面上的某一点：
+    - 便利贴的右边 = T 轴（UV 的 U 方向）
+    - 便利贴的上边 = B 轴（UV 的 V 方向）
+    - 便利贴垂直朝外的方向 = N 轴
+
+  法线贴图里的每个像素，就描述了在"这个便利贴坐标系"里，法线向哪偏了一点点。
+
+  重要推论：
+    - 每个顶点都有自己的 TBN
+    - GPU 插值后，每个像素都有自己的 TBN
+
+─────────────────────────────
+2-2 为什么法线贴图存储切线空间法线（而不是世界空间法线）
+─────────────────────────────
+
+  【核心原因】
+  法线贴图存储切线空间法线，是因为切线空间法线可以适配任意朝向的模型，
+  而不是固定记录世界空间法线。
+
+  具体好处：
+    ① 同一张法线贴图可以复用到模型不同位置、不同朝向，甚至不同模型；
+    ② 模型旋转、移动后，切线空间法线仍然有效，无需重新烘焙；
+    ③ 文件存储量小，且贴图可以进行纹理压缩（DXT5nm 等格式）。
+
+  世界空间法线贴图的缺点：
+    ① 只能用于特定朝向的模型，模型旋转后法线立即失效；
+    ② 无法跨模型复用；
+    ③ 无法进行常规纹理压缩（三个通道均不可省）。
+
+─────────────────────────────
+2-3 为什么法线贴图通常呈蓝紫色
+─────────────────────────────
+
+  法线贴图默认存储的是切线空间法线。
+  平坦表面的法线是 (0, 0, 1)，即完全朝 N 轴方向。
+  颜色编码公式：Color = Normal * 0.5 + 0.5
+  所以 (0, 0, 1) → (0.5, 0.5, 1.0) → 渲染出来就是蓝紫色。
+
+  也就是说：
+    - 蓝紫色区域 = 该像素法线几乎没有偏转，法线垂直于表面
+    - 彩色区域   = 该像素法线有偏转，模拟凹凸细节
+
+
+================================================================================
+三、TBN 矩阵的构建（逐顶点）
+================================================================================
+
+【构建目的】
+  顶点着色器（Vertex Shader）中，计算每个顶点在世界空间下的 T、B、N 方向，
+  构成一个"从切线空间到世界空间"的变换矩阵，传入片元着色器使用。
+
+【数据来源】
+  - N 方向：顶点的 normal 属性（模型空间）
+  - T 方向：顶点的 tangent 属性（模型空间，由 DCC 软件或引擎烘焙时计算）
+  - B 方向：通过 N × T 叉积计算（不从 mesh 读取，实时推导）
+
+  tangent.w 是一个符号位（±1），用于处理 UV 镜像情况。
+  叉积结果乘以 tangent.w 可以正确反转 B 轴方向。
+
+【代码】
+  float3 nDirWS = normalize(TransformObjectToWorldNormal(v.normal));
+  float3 tDirWS = normalize(TransformObjectToWorldDir(v.tangent.xyz));
+
+  // 施密特正交化（见第五节）
+  tDirWS = normalize(tDirWS - nDirWS * dot(nDirWS, tDirWS));
+
+  float3 bDirWS = cross(nDirWS, tDirWS) * v.tangent.w;
+
+【打包进插值变量】
+  顶点着色器把 TBN 打包进 float4，借用 .w 分量传递顶点世界坐标：
+
+  o.TtoW0 = float4(tDirWS.x, bDirWS.x, nDirWS.x, posWS.x);
+  o.TtoW1 = float4(tDirWS.y, bDirWS.y, nDirWS.y, posWS.y);
+  o.TtoW2 = float4(tDirWS.z, bDirWS.z, nDirWS.z, posWS.z);
+
+  这样每行存的是 T/B/N 某一分量的全部三轴，是"行主序"的 3×3 矩阵打包方式。
+
+─────────────────────────────
+3-1 TBN 矩阵的数学结构
+─────────────────────────────
+
+  如果写成矩阵形式：
+
+      │ Tx  Bx  Nx │
+  M = │ Ty  By  Ny │
+      │ Tz  Bz  Nz │
+
+  M 是一个旋转矩阵（若三轴正交且单位长度），M^T = M^-1
+
+  作用：将切线空间向量乘以 M，得到世界空间向量。
+  即：worldVec = M * tangentVec
+
+  HLSL 写法：
+    float3x3 TBN = float3x3(T, B, N);
+    worldNormal = normalize(mul(TBN, tangentNormal));
+
+  若需要反向转换（世界空间 → 切线空间），利用正交矩阵性质，转置即逆：
+    tangentDir = mul(transpose(TBN), worldDir);
+
+─────────────────────────────
+3-2 GPU 完整流程概览
+─────────────────────────────
+
+  顶点数据：Position · Normal · Tangent
+       ↓
+  计算 Bitangent：  B = cross(N, T) * tangent.w
+       ↓
+  组成 TBN 矩阵
+       ↓
+  GPU 线性插值（顶点 → 片元）
+       ↓
+  片元读取 Normal Map，采样 → 解码
+       ↓
+  TBN × 切线空间法线 → 世界空间法线
+       ↓
+  光照计算（Lambert 漫反射 / Blinn-Phong 高光 / PBR 等）
+
+
+================================================================================
+四、为什么需要施密特正交化（Gram-Schmidt）
+================================================================================
+
+─────────────────────────────
+4-1 导致非正交的原因（综合两份笔记）
+─────────────────────────────
+
+  理论上 T、B、N 应该两两垂直，构成标准正交基，但实际情况中以下因素
+  都会破坏正交性：
+
+  ① 非均匀缩放（Non-Uniform Scale）
+     模型经过非均匀缩放后，法线和切线的变换方式不同：
+       - 法线：需要用"逆转置矩阵"变换
+       - 切线：用"普通变换矩阵"变换
+     两者变换规则不同，导致变换后不再正交。
+
+  ② 模型导出误差
+     DCC 软件（Maya / Blender / 3ds Max 等）在烘焙切线时存在精度误差，
+     导致 T 和 N 本身就略有偏差。
+
+  ③ GPU 线性插值破坏正交性
+     GPU 对顶点属性做线性插值（Barycentric Interpolation），即使每个顶点的
+     T 和 N 完全正交，插值后的像素级 T 和 N 也可能轻微偏离正交。
+
+  ④ 蒙皮动画（Skinning）
+     骨骼动画下，顶点的法线和切线随骨骼权重混合变换，混合后容易丢失正交性。
+
+  ⑤ 浮点精度误差
+     GPU 的浮点运算本身存在精度损失，累积后也会造成轻微偏差。
+
+  可视化示意（T 与 N 出现夹角）：
+           N
+           ↑
+          /
+         /   ← T 与 N 之间出现了夹角，不再垂直
+        T
+
+─────────────────────────────
+4-2 非正交 TBN 会造成哪些视觉错误
+─────────────────────────────
+
+  如果 T 和 N 不正交，叉积得到的 B 就不正确，
+  整个 TBN 矩阵就不再是标准正交基，法线转换结果会出现：
+
+  ① 法线方向轻微拉伸（Stretching）
+  ② 光照出现异常，明暗分界不自然
+  ③ Normal Map 视觉失真，凹凸效果不准确
+  ④ 各向异性高光方向偏移，高光拉伸或错位
+  ⑤ Parallax Mapping 等高级技术的 UV 偏移方向计算出错
+
+
+================================================================================
+五、施密特正交化原理与实现
+================================================================================
+
+─────────────────────────────
+5-1 数学原理
+─────────────────────────────
+
+  给定两个不一定正交的向量 N（法线）和 T（切线）：
+
+  目标：把 T 修正成与 N 垂直的 T'，同时尽量保留 T 的主方向。
+
+  步骤：
+    (1) 计算 T 在 N 上的投影分量（即 T 在 N 方向的"影子向量"）：
+        proj = dot(T, N) * N
+
+    (2) 从 T 中减去这个投影分量（等于把 T 中"平行于 N 的部分"去掉）：
+        T' = T - proj = T - dot(T, N) * N
+
+    (3) 归一化 T'：
+        T' = normalize(T')
+
+  几何直觉：
+    dot(T, N) 是 T 在 N 方向上的"影子长度"。
+    dot(T, N) * N 是 T 在 N 方向上的"影子向量"。
+    T 减去"影子"，剩下的就是垂直于 N 的分量。
+
+  公式（统一写法）：
+    T' = normalize(T - N * dot(N, T))
+
+  HLSL 代码：
+    tDirWS = normalize(tDirWS - nDirWS * dot(nDirWS, tDirWS));
+
+  正交化策略：
+    保持 N 不变 → 修正 T → 重新计算 B
+    B = cross(N, T') * tangent.w
+
+  最终得到：
+    T' ⟂ N，B ⟂ N，B ⟂ T' → 重新形成标准正交坐标系
+
+─────────────────────────────
+5-2 逐顶点正交化 vs 逐像素正交化
+─────────────────────────────
+
+  【问题】施密特正交化分逐像素和逐顶点两种吗？
+
+  【答案】是的，确实有两种做法，在不同场合下使用，性能和质量有明显差异。
+
+  ┌────────────────┬──────────────────────────┬──────────────────────────────┐
+  │   对比项        │   逐顶点正交化            │   逐像素正交化                │
+  ├────────────────┼──────────────────────────┼──────────────────────────────┤
+  │ 执行阶段        │ Vertex Shader            │ Fragment Shader              │
+  │ 执行次数        │ 每个顶点执行一次          │ 每个像素执行一次              │
+  │ 性能开销        │ 低（顶点数通常远少于像素）│ 高（像素数量通常是顶点的百倍）│
+  │ 精度/质量       │ 较低（依赖插值）          │ 较高（逐像素精确计算）        │
+  │ 适用场景        │ 一般游戏实时渲染          │ 高品质渲染、法线精度要求高时  │
+  │ 典型代表        │ 大多数游戏引擎默认做法    │ 部分高端 PBR shader           │
+  └────────────────┴──────────────────────────┴──────────────────────────────┘
+
+  【逐顶点正交化（Per-Vertex）详解】
+    在 Vertex Shader 中对 T 和 N 做正交化，得到正交 TBN，然后把 T、B、N
+    作为插值量传入 Fragment Shader。
+
+    由于 GPU 会对顶点输出做线性插值（Interpolation），即使顶点 TBN 是正交的，
+    插值后的 TBN 也可能轻微偏离正交。但对于大多数情况，这个误差可以接受。
+
+    代码位置：Vertex Shader
+      tDirWS = normalize(tDirWS - nDirWS * dot(nDirWS, tDirWS));
+
+  【逐像素正交化（Per-Pixel / Per-Fragment）详解】
+    把原始的 T 和 N 插值后传入 Fragment Shader，然后在每个像素点分别
+    重新做正交化（施密特），保证每个像素的 TBN 都是完全正交的。
+
+    代价是 Fragment Shader 里多做几次乘法和 normalize，像素越多，开销越大。
+
+    代码位置：Fragment Shader
+      // 从插值变量中重建 T 和 N（先归一化，消除插值引入的长度偏差）
+      float3 N = normalize(i.nDirWS);
+      float3 T = normalize(i.tDirWS);
+      // 逐像素施密特正交化
+      T = normalize(T - N * dot(N, T));
+      float3 B = cross(N, T) * tangentW;
+      // 构建逐像素 TBN 矩阵
+      float3x3 TBN = float3x3(T, B, N);
+      float3 nDirWS = normalize(mul(nDirTS, TBN));
+
+  【Unity URP 的默认做法】
+    Unity 默认在 Vertex Shader 中构建 TBN（逐顶点），
+    插值后在 Fragment Shader 中使用。
+    若需要更高精度，可以手动改成逐像素正交化。
+
+  【什么时候用逐像素正交化】
+    - 模型有较大非均匀缩放
+    - 法线细节极为重要（例如脸部、皮肤、写实角色）
+    - 使用了 Parallax Mapping 或 Relief Mapping 等更复杂的法线技术
+    - 目标平台性能足够（PC / 主机，而非移动端）
+
+─────────────────────────────
+5-3 为什么不能完全信任模型导出的 TBN（插值破坏正交性）
+─────────────────────────────
+
+  【关键问题】
+  即使模型在顶点级别存储了完全正交的 TBN，GPU 插值后，
+  每个像素的 Normal 和 Tangent 都会发生变化。
+
+  由于线性插值不保持向量长度和正交性，
+  即使顶点时完全垂直，插值后也可能不再垂直。
+
+  因此，很多高质量 Shader 在片元阶段都会重新执行一次：
+
+    N = normalize(N);                      // 消除插值引入的长度偏差
+    T = normalize(T - N * dot(T, N));     // 重新正交化
+    B = cross(N, T) * tangent.w;          // 重新计算副切线
+
+  这是 URP、HDRP、Unreal Engine 等渲染管线的常见做法，
+  也是高质量 PBR 渲染的标准实践。
+
+
+================================================================================
+六、法线贴图的采样与解码
+================================================================================
+
+【采样】
+  float4 rawNormal = SAMPLE_TEXTURE2D(_bumpMap, sampler_bumpMap, i.uv0);
+
+  这里采样得到的是 0~1 范围内的颜色值，不是真正的法线方向。
+
+【解码：UnpackNormal】
+  float3 nDirTS = UnpackNormal(rawNormal).rgb;
+
+  UnpackNormal 是 URP 内置函数，做的事情是：
+    normal = color * 2.0 - 1.0
+  把 0~1 的颜色还原成 -1~1 的法线分量。
+  对于 DXT5nm 格式（两通道压缩），还原算法略有不同，UnpackNormal 会自动处理。
+
+【法线强度控制】
+  nDirTS.xy *= _bumpScale;
+  nDirTS.z = sqrt(1.0 - saturate(dot(nDirTS.xy, nDirTS.xy)));
+
+  - 只缩放 X 和 Y：增强/减弱法线在切线空间内的横向偏移
+  - _bumpScale = 0 → 法线趋近 (0,0,1)，表面完全平滑
+  - _bumpScale = 1 → 原始强度
+  - _bumpScale > 1 → 凹凸增强
+  - 重新计算 Z 是为了让法线重新接近单位长度
+    公式来自：x² + y² + z² = 1 → z = sqrt(1 - x² - y²)
+
+【最终归一化】
+  nDirTS = normalize(nDirTS);
+
+  修改 XY 后，向量不一定是严格单位长度，归一化确保正确性。
+
+【Normal Map 默认值的含义】
+  默认蓝色 (0, 0, 1) 表示：局部法线没有发生偏转，即该像素的法线垂直于表面。
+
+
+================================================================================
+七、切线空间法线 → 世界空间法线（TBN 矩阵的使用）
+================================================================================
+
+【目的】
+  法线贴图解码出来的 nDirTS 是切线空间的法线，
+  而光照计算需要世界空间的法线 nDirWS。
+  这一步就是用 TBN 矩阵完成这个转换。
+
+【原理】
+  设 TBN 矩阵各列分别是 T、B、N 世界空间方向向量，
+  把切线空间法线看成"在 T、B、N 方向上的线性组合"：
+
+  nDirWS = T * nDirTS.x + B * nDirTS.y + N * nDirTS.z
+
+  这等价于矩阵向量乘法：
+  nDirWS = M * nDirTS（其中 M 的列是 T、B、N）
+
+【打包方式下的 dot 写法】
+  前面打包 TBN 的方式是按行存储（T/B/N 的各分量分别存到每个 float4 的 xyz）：
+
+  TtoW0 = (T.x, B.x, N.x, posWS.x)
+  TtoW1 = (T.y, B.y, N.y, posWS.y)
+  TtoW2 = (T.z, B.z, N.z, posWS.z)
+
+  所以转换写成：
+  nDirWS.x = dot(i.TtoW0.xyz, nDirTS);  // = T.x*ts.x + B.x*ts.y + N.x*ts.z
+  nDirWS.y = dot(i.TtoW1.xyz, nDirTS);  // = T.y*ts.x + B.y*ts.y + N.y*ts.z
+  nDirWS.z = dot(i.TtoW2.xyz, nDirTS);  // = T.z*ts.x + B.z*ts.y + N.z*ts.z
+  nDirWS = normalize(nDirWS);
+
+【逐像素方式下的矩阵乘法写法（更直观）】
+  float3x3 TBN = float3x3(T, B, N);   // 三行是 T、B、N（列主序）
+  float3 nDirWS = normalize(mul(nDirTS, TBN));
+  // 等价于 nDirWS = normalize(T * nDirTS.x + B * nDirTS.y + N * nDirTS.z)
+
+【为什么结果要 normalize】
+  插值、施密特近似、数值精度都可能让结果略偏离单位长度，归一化确保光照计算正确。
+
+
+================================================================================
+八、用于光照计算
+================================================================================
+
+【基本思路】
+  拿到 nDirWS 后，光照计算和使用顶点法线时完全一样，只是法线精度更高。
+
+【Lambert 漫反射】
+  float3 lDir = normalize(mainLight.direction);
+  float NdotL = saturate(dot(nDirWS, lDir));  // 余弦值，限制在 0~1
+  float3 diffuse = baseColor * NdotL * mainLight.color;
+
+【Blinn-Phong 高光】
+  float3 vDir = normalize(_WorldSpaceCameraPos - posWS);  // 视线方向
+  float3 hDir = normalize(lDir + vDir);                   // 半程向量
+  float NdotH = saturate(dot(nDirWS, hDir));
+  float3 specular = pow(NdotH, _Shininess) * mainLight.color;
+
+【视差遮蔽贴图（进阶）】
+  在做 Parallax Mapping 时，还需要用 TBN 的逆（或转置）
+  把世界空间视线方向转到切线空间，用于 UV 偏移计算。
+  TBN 是正交矩阵，M^-1 = M^T，转置即可。
+  float3 viewDirTS = mul(TBN_transposed, viewDirWS);
+
+
+================================================================================
+九、完整代码注释示例（URP HLSL）
+================================================================================
+
+─────────── Vertex Shader ───────────
+
+Varyings vert(Attributes v)
+{
+    Varyings o;
+
+    // MVP 变换：模型空间 → 裁剪空间
+    o.pos = TransformObjectToHClip(v.vertex.xyz);
+
+    // UV 传递（无变换）
+    o.uv0 = v.texcoord0;
+
+    // 顶点世界坐标（用于后续光照）
+    float3 posWS = TransformObjectToWorld(v.vertex.xyz);
+
+    // 法线和切线变换到世界空间
+    float3 nDirWS = normalize(TransformObjectToWorldNormal(v.normal));
+    float3 tDirWS = normalize(TransformObjectToWorldDir(v.tangent.xyz));
+
+    // ★ 施密特正交化（逐顶点）：让 T 与 N 严格正交
+    //   去掉 T 在 N 方向上的投影分量
+    tDirWS = normalize(tDirWS - nDirWS * dot(nDirWS, tDirWS));
+
+    // 叉积得到副切线，* tangent.w 处理 UV 镜像
+    float3 bDirWS = cross(nDirWS, tDirWS) * v.tangent.w;
+
+    // 打包 TBN 矩阵（按列的各行分量）+ 世界坐标
+    o.TtoW0 = float4(tDirWS.x, bDirWS.x, nDirWS.x, posWS.x);
+    o.TtoW1 = float4(tDirWS.y, bDirWS.y, nDirWS.y, posWS.y);
+    o.TtoW2 = float4(tDirWS.z, bDirWS.z, nDirWS.z, posWS.z);
+
+    return o;
+}
+
+─────────── Fragment Shader ───────────
+
+half4 frag(Varyings i) : SV_Target
+{
+    // ── 1. 采样漫反射贴图 ──
+    float4 diffuseTex = SAMPLE_TEXTURE2D(_Diffuse, sampler_diffuse, i.uv0);
+    float3 baseColor = diffuseTex.rgb;
+    float diffuseA   = diffuseTex.a;
+
+    // ── 2. 采样 Lightmap ──
+    float4 lightmap = SAMPLE_TEXTURE2D(_lightmap, sampler_lightmap, i.uv0);
+
+    // ── 3. 法线贴图：采样 → 解码 → 强度调整 ──
+    float3 nDirTS = UnpackNormal(
+        SAMPLE_TEXTURE2D(_bumpMap, sampler_bumpMap, i.uv0)
+    ).rgb;
+
+    // 控制法线强度（只调 xy 分量）
+    nDirTS.xy *= _bumpScale;
+
+    // 根据新的 xy 重新计算 z，保持单位向量特性
+    nDirTS.z = sqrt(1.0 - saturate(dot(nDirTS.xy, nDirTS.xy)));
+
+    // 归一化法线
+    nDirTS = normalize(nDirTS);
+
+    // ── 4. TBN 矩阵变换：切线空间法线 → 世界空间法线 ──
+    float3 nDirWS;
+    nDirWS.x = dot(i.TtoW0.xyz, nDirTS);
+    nDirWS.y = dot(i.TtoW1.xyz, nDirTS);
+    nDirWS.z = dot(i.TtoW2.xyz, nDirTS);
+    nDirWS = normalize(nDirWS);
+
+    // ── 5. 重建世界空间顶点位置 ──
+    float3 posWS = float3(i.TtoW0.w, i.TtoW1.w, i.TtoW2.w);
+
+    // ── 6. 光照计算 ──
+    Light mainLight = GetMainLight();
+    float3 lDir = normalize(mainLight.direction);
+    float3 vDir = normalize(GetWorldSpaceViewDir(posWS));
+    float3 hDir = normalize(lDir + vDir);
+
+    float NdotL = saturate(dot(nDirWS, lDir));           // 漫反射因子
+    float NdotH = saturate(dot(nDirWS, hDir));           // 高光因子
+    float3 specular = pow(NdotH, _Shininess);
+
+    float3 finalColor = baseColor * NdotL + specular;
+
+    return half4(finalColor, diffuseA);
+}
+
+─────────── [可选] 逐像素正交化的 Fragment Shader 写法 ───────────
+
+// 从插值变量重建并重新正交化 TBN
+float3 N = normalize(i.nDirWS);          // 消除插值长度偏差
+float3 T = normalize(i.tDirWS);          // 同上
+T = normalize(T - N * dot(N, T));        // 逐像素施密特正交化
+float3 B = cross(N, T) * i.tangentW;    // 重新计算副切线
+
+// 构建逐像素 TBN 矩阵并转换法线
+float3x3 TBN = float3x3(T, B, N);
+float3 nDirWS = normalize(mul(nDirTS, TBN));
+
+
+================================================================================
+十、常见错误与注意点
+================================================================================
+
+【错误 1：用 TransformObjectToWorld 变换切线】
+  ✗ float3 tDirWS = TransformObjectToWorld(v.tangent.xyz);
+  ✓ float3 tDirWS = TransformObjectToWorldDir(v.tangent.xyz);
+
+  原因：TransformObjectToWorld 包含平移，用于点（Position）变换。
+        方向向量（Direction）变换不应包含平移，要用 Dir 版本。
+
+【错误 2：忘记做施密特正交化】
+  模型经过非均匀缩放后，T 和 N 不再正交，不做正交化会导致光照扭曲。
+  同样，GPU 插值后也可能破坏正交性，高精度场景下应在片元阶段重新正交化。
+
+【错误 3：忘记 tangent.w 符号处理】
+  ✗ float3 bDirWS = cross(nDirWS, tDirWS);
+  ✓ float3 bDirWS = cross(nDirWS, tDirWS) * v.tangent.w;
+
+  原因：UV 镜像时副切线方向需要反转，tangent.w 存储了这个符号（±1）。
+
+【错误 4：强度调整后不重新计算 Z】
+  修改 nDirTS.xy 后如果直接 normalize，结果会有偏差，
+  最好先用公式重新计算 Z，再 normalize。
+
+【错误 5：法线未在片元着色器末尾 normalize】
+  顶点间插值不保持单位长度，片元阶段用到法线前一定要 normalize。
+
+【注意：两种正交化的权衡】
+  逐顶点：快，但大三角面上可能有轻微误差；插值后可能再次破坏正交性。
+  逐像素：准，但像素多时开销显著，移动端慎用。
+  高质量项目（写实角色 / PBR）推荐逐像素；普通游戏逐顶点已足够。
+
+
+================================================================================
+十一、常用公式速查
+================================================================================
+
+  计算 Bitangent（副切线）：
+    B = cross(N, T) * tangent.w;
+
+  Gram-Schmidt 正交化（统一写法）：
+    T = normalize(T - N * dot(T, N));
+
+  颜色 → 法线（解码）：
+    normal = color * 2.0 - 1.0;
+
+  法线 → 颜色（编码）：
+    color = normal * 0.5 + 0.5;
+
+  法线强度 Z 分量重算：
+    z = sqrt(1.0 - saturate(dot(normal.xy, normal.xy)));
+
+  切线空间 → 世界空间：
+    worldNormal = normalize(mul(TBN, tangentNormal));
+
+  世界空间 → 切线空间（TBN 正交时）：
+    tangentDir = mul(transpose(TBN), worldDir);
+
+  漫反射（Lambert）：
+    NdotL = saturate(dot(nDirWS, lightDir));
+
+  高光（Blinn-Phong 半程向量）：
+    hDir = normalize(lightDir + viewDir);
+    NdotH = saturate(dot(nDirWS, hDir));
+
+
+================================================================================
+十二、知识关系图（文字版）
+================================================================================
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                         法线贴图完整流程                                 │
+  │                                                                          │
+  │  [模型数据]                                                              │
+  │   └─ vertex.normal       ──→ TransformToWorldNormal ──→ nDirWS (N)      │
+  │   └─ vertex.tangent.xyz  ──→ TransformToWorldDir    ──→ tDirWS (T)      │
+  │   └─ vertex.tangent.w    ──→ 用于 B 轴符号（处理 UV 镜像）              │
+  │                                     │                                   │
+  │                          ┌──────────┘                                   │
+  │                          ▼                                               │
+  │                   施密特正交化（Per-Vertex）                             │
+  │                   T' = normalize(T - N * dot(N,T))                      │
+  │                          │                                               │
+  │                          ▼                                               │
+  │                   B = cross(N, T') * tangent.w                          │
+  │                          │                                               │
+  │                          ▼                                               │
+  │                   TBN 矩阵打包 → 传入 Fragment Shader（GPU 插值）       │
+  │                                                                          │
+  │  [Fragment Shader]                                                       │
+  │   └─ 采样法线贴图 → UnpackNormal → nDirTS（切线空间）                  │
+  │   └─ 强度调整：xy *= bumpScale，重算 z                                  │
+  │   └─ normalize(nDirTS)                                                  │
+  │                          │                                               │
+  │                          ▼                                               │
+  │               [可选] 施密特正交化（Per-Pixel）                          │
+  │               N = normalize(N)                                           │
+  │               T = normalize(T - N * dot(N,T))   ← 更精确               │
+  │               B = cross(N, T) * tangent.w                               │
+  │                          │                                               │
+  │                          ▼                                               │
+  │                   TBN 矩阵变换                                           │
+  │                   nDirWS = T*ts.x + B*ts.y + N*ts.z                     │
+  │                   nDirWS = normalize(nDirWS)                            │
+  │                          │                                               │
+  │                          ▼                                               │
+  │               用于世界空间光照计算                                       │
+  │               dot(nDirWS, lightDir) → NdotL → diffuse                  │
+  │               dot(nDirWS, halfDir)  → NdotH → specular                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+十三、一句话总结 & 记忆链路
+================================================================================
+
+【各概念一句话总结】
+
+  切线空间：    模型每个点自己的局部坐标系（T = U方向，B = V方向，N = 法线）。
+
+  TBN 矩阵：    局部坐标系（切线空间）与世界坐标系之间的转换矩阵。
+
+  Normal Map：  记录每个像素在局部坐标系下的法线方向，默认蓝色表示不偏转。
+
+  Gram-Schmidt：修正 TBN，使三个轴重新保持正交，保证光照计算准确。
+
+  逐顶点正交化：在 Vertex Shader 做，性能好，适合大多数游戏场景。
+
+  逐像素正交化：在 Fragment Shader 做，精度高，适合写实角色/高品质 PBR。
+
+
+【完整记忆链路】
+
+  模型顶点数据（Normal / Tangent）
+       ↓
+  变换到世界空间（TransformObjectToWorldNormal / TransformObjectToWorldDir）
+       ↓
+  Gram-Schmidt 正交化（逐顶点，保持 N 不变，修正 T）
+       ↓
+  叉积计算 Bitangent（B = cross(N, T') × tangent.w）
+       ↓
+  打包 TBN 矩阵 → GPU 插值传递到 Fragment Shader
+       ↓
+  采样 Normal Map → UnpackNormal → 强度调整 → normalize
+       ↓
+  [可选] Gram-Schmidt 正交化（逐像素，消除插值误差）
+       ↓
+  TBN 矩阵变换：切线空间法线 → 世界空间法线
+       ↓
+  光照计算（Lambert NdotL / Blinn-Phong NdotH / PBR）
+
+
+================================================================================
+END OF NOTE
+================================================================================
