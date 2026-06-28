@@ -1,0 +1,1410 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║     原神风格 NPR 角色渲染 · 身体 Shader 完整整合笔记                           ║
+║     理论原理 · 设计思想 · 贴图通道 · Pass 架构 · HLSL 代码 · 参数速查          ║
+║     整合自：Genshin_Shader_完整笔记 + 原神NPR身体Shader                        ║
+║     适用平台：Unity URP（HLSL）                                                 ║
+║     整理日期：2026-06-29                                                        ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+【目录】
+  第一章   NPR 核心设计思想 —— 为什么不用真实光照
+  第二章   整体渲染架构 —— 三个 Pass 的顺序与职责
+           2.1  正面主体渲染 Pass
+           2.2  背面渲染 Pass
+           2.3  描边渲染 Pass
+           2.4  URP Renderer Feature 配置步骤
+  第三章   数据结构：v2f / Varyings —— 顶点到片元的数据桥梁
+           3.1  SV_POSITION
+           3.2  UV0
+           3.3  TtoW0/1/2：TBN 矩阵 + 世界坐标打包
+  第四章   Properties 参数完整解析
+           4.1  参数分组总览
+           4.2  命名混淆对照表
+           4.3  _bright / _grey / _dark 含义
+  第五章   五张贴图详解
+           5.1  _diffuse       基础色贴图
+           5.2  _lightmap      ILM 控制图（最核心）
+           5.3  _ramp          Shadow Ramp 阴影色带
+           5.4  _bumpMap       法线贴图
+           5.5  _metalMap      金属 MatCap 贴图
+  第六章   光照向量体系（代码准备）
+  第七章   Ramp 阴影系统 —— 原理 + 完整代码
+  第八章   Blinn-Phong 风格化高光 —— 原理 + 完整代码
+  第九章   MatCap 金属反射 —— 原理 + 完整代码
+  第十章   菲涅尔边缘光 —— 原理 + 完整代码
+  第十一章  屏幕深度边缘光（进阶）
+  第十二章  自发光闪烁 —— 原理 + 完整代码
+  第十三章  Body 合成模块 —— 所有子模块的总入口
+  第十四章  完整 frag 片元着色器流程
+  第十五章  描边 Pass 详解 —— Inverted Hull + 多色描边
+  第十六章  脸部 vs 身体 —— 为什么要区分两套逻辑
+  第十七章  常见问题与注意事项
+  第十八章  总结速查表
+           18.1  贴图通道总览
+           18.2  渲染阶段速查
+           18.3  最终颜色计算公式
+           18.4  参数推荐范围
+
+
+================================================================================
+第一章   NPR 核心设计思想 —— 为什么不用真实光照
+================================================================================
+
+原神风格 NPR（Non-Photorealistic Rendering，非真实感渲染）的身体 Shader
+与传统 PBR 渲染有本质区别。
+
+【核心公式对比】
+  PBR：最终颜色 = 物理光照公式（BRDF） × 材质参数（粗糙度、金属度等）
+  NPR：最终颜色 = Diffuse × Ramp（由光照方向选择） + 各种美术控制修正项
+
+  PBR 的光照几乎决定一切 —— 粗糙度、金属度、环境反射、菲涅尔全由物理公式驱动。
+  NPR 的光照只是一个"触发器" —— 它只负责判断当前像素处于亮面还是暗面。
+  真正决定"暗面变成什么颜色"的是 Ramp 贴图（美术预先画好的色带）。
+  真正决定"哪里能出高光、哪里有固定阴影、该采哪条 Ramp"的是 Lightmap 贴图。
+
+【四个核心控制层】
+  1. NdotL（法线与光照方向夹角余弦）
+       决定"当前像素处于亮面还是暗面"，是整个明暗的起点，产生 0~1 的灰度值。
+
+  2. Ramp 贴图（预先绘制好的色带图）
+       决定"处于暗面时应该变成什么颜色"。
+       不同材质（皮肤/布料/金属）对应不同行的 Ramp，暗部色调完全不同。
+
+  3. Lightmap 通道（RGBA 四通道材质控制图）
+       决定"这个像素属于哪种材质、能不能出现高光、固定阴影是否常驻"。
+       是整个 Shader 最重要的美术控制图。
+
+  4. Diffuse 贴图（基础色图）
+       提供角色表面原始颜色。
+       亮面基本接近 Diffuse 颜色，暗面 = Diffuse × Ramp。
+
+【为什么不能用真实光照】
+  ① 真实光照让暗部发灰、明暗连续，破坏二次元大色块的干净感
+  ② 真实光照让皮肤暗部、衣服暗部、金属暗部颜色一样，失去材质层次
+  ③ 真实光照让角色随场景光源剧烈变化，失去稳定的视觉风格
+  ④ NPR 的目标是"可控的美术结果"，不是"符合物理的真实结果"
+  ⑤ 贴图预制等于把美术判断存进 GPU，不需要实时物理计算
+
+
+================================================================================
+第二章   整体渲染架构 —— 三个 Pass 的顺序与职责
+================================================================================
+
+一个完整的原神风格角色不是"一次画完"的，而是分三个 Pass 按顺序渲染：
+
+  渲染顺序：正面 → 背面 → 描边
+
+────────────────────────────────────────────────────────────────────────────────
+2.1  正面主体渲染 Pass（Front Face Pass）
+────────────────────────────────────────────────────────────────────────────────
+
+  这是身体渲染的核心 Pass，负责绘制所有可见材质效果。
+
+  Shader 设置：
+    Tags { "LightMode" = "UniversalForward" }   ← URP 默认 Forward 渲染，自动执行
+    Cull Back     ← 剔除背面，只渲染正面（正常朝向观察者的面）
+    ZWrite On     ← 写入深度缓冲，后续物体遮挡关系正确
+    ZTest LEqual  ← 正常深度测试，近处物体挡住远处物体
+
+  负责内容：
+    基础色（Diffuse）/ Shadow Ramp 阴影 / Lightmap AO / 法线贴图细节
+    风格化高光 / 金属 MatCap 反射 / Fresnel 边缘光 / 自发光（Emission）
+
+  ⚠️ 常见错误：
+    Tags{"LightMode"="Head"} 不是 URP 标准识别的 LightMode，
+    除非写了对应 Renderer Feature，否则 Pass 不会被渲染。
+    应改为：Tags{"LightMode"="UniversalForward"}
+
+────────────────────────────────────────────────────────────────────────────────
+2.2  背面渲染 Pass（Back Face Pass）
+────────────────────────────────────────────────────────────────────────────────
+
+  用于解决薄片模型背面不可见的问题（头发、裙摆、披风、飘带等）。
+
+  Shader 设置：
+    Tags { "LightMode" = "GenshinBackFace" }   ← 自定义名，通过 Renderer Feature 调用
+    Cull Front    ← 剔除正面，只渲染背面
+    ZWrite Off    ← 不写入深度，避免影响后续描边和正面穿插
+    ZTest LEqual
+
+  【为什么不直接 Cull Off，而是用单独背面 Pass？】
+    Cull Off 会出现：
+    - 背面法线方向与光照方向相反，NdotL 为负，背面异常变亮或变黑
+    - 正面和背面深度叠加复杂，排序容易出错
+    - Alpha Clip 在背面可能产生多余裁剪边缘
+    - 无法给背面单独设置不同颜色
+
+    单独背面 Pass 优点：
+    ① 可以给背面设置不同颜色（通常稍暗）
+    ② Cull 方向明确，不互相干扰
+    ③ ZWrite Off 保证后续描边不被背面深度影响
+
+────────────────────────────────────────────────────────────────────────────────
+2.3  描边渲染 Pass（Outline Pass）
+────────────────────────────────────────────────────────────────────────────────
+
+  使用 Inverted Hull（反向壳）方法：把模型沿法线外扩后只渲染背面，形成轮廓线。
+
+  Shader 设置：
+    Tags { "LightMode" = "GenshinOutline" }
+    Cull Front    ← 剔除正面，只画外扩后的背面（即描边区域）
+    ZWrite Off
+    ZTest LEqual
+
+  核心顶点代码：
+    positionOS.xyz += normalize(normalOS) * _outline;
+
+  原理：
+    ① 把模型沿每个顶点法线方向向外扩大一点点
+    ② 只渲染外扩模型的背面（Cull Front）
+    ③ 外扩模型的正面被原始角色深度挡住，不可见
+    ④ 只有边缘位置，外扩模型的背面"露出来"，这就是描边
+
+  【为什么描边一定要最后画？】
+    正确顺序：先正面（写入深度）→ 再背面（不写深度）→ 最后描边（不写深度）
+
+────────────────────────────────────────────────────────────────────────────────
+2.4  URP Renderer Feature 配置完整步骤
+────────────────────────────────────────────────────────────────────────────────
+
+  背面 Pass 和描边 Pass 不会被 URP 自动执行，必须通过 Renderer Feature 手动触发。
+
+  第一步：找到 Renderer Data（不是 URP Global Settings！）
+    方法 A：Project 面板搜索 t:UniversalRendererData
+    方法 B：Edit → Project Settings → Graphics → 点击 URP Asset → 查看 Renderer List
+
+    ⚠️ 注意：Project Settings → Graphics → URP Global Settings 里只有
+    Rendering Layers 和 Shader Stripping，找不到 Renderer Feature！
+
+  第二步：在 Renderer Data 的 Inspector 里点击 Add Renderer Feature → 选 Render Objects
+
+  第三步：配置背面 Feature
+    Name: Character_BackFace  |  Pass Names: GenshinBackFace
+    Event: After Rendering Opaques  |  Layer Mask: 仅勾选 Character 层
+
+  第四步：配置描边 Feature
+    Name: Character_Outline  |  Pass Names: GenshinOutline
+    Event: After Rendering Opaques  |  Layer Mask: 仅勾选 Character 层
+
+  第五步：确保 Feature 顺序（从上到下）
+    1. Character_BackFace  →  先画背面
+    2. Character_Outline   →  再画描边
+
+  第六步：给角色单独建 Layer（Character），避免对所有物体都额外绘制
+
+
+================================================================================
+第三章   数据结构：v2f / Varyings —— 顶点到片元的数据桥梁
+================================================================================
+
+顶点着色器（Vertex Shader）传给片元着色器（Fragment Shader）的中间数据结构。
+
+  struct Varyings {
+      float4 pos   : SV_POSITION;   // 裁剪空间位置，给 GPU 光栅化用
+      float2 uv0   : TEXCOORD0;     // UV0，用于采样贴图
+      float4 TtoW0 : TEXCOORD1;     // T.x  B.x  N.x  posWS.x
+      float4 TtoW1 : TEXCOORD2;     // T.y  B.y  N.y  posWS.y
+      float4 TtoW2 : TEXCOORD3;     // T.z  B.z  N.z  posWS.z
+  };
+
+────────────────────────────────────────────────────────────────────────────────
+3.1  pos : SV_POSITION —— 裁剪空间位置
+────────────────────────────────────────────────────────────────────────────────
+
+  MVP 变换流程：
+    模型空间 → 世界空间（M 矩阵）→ 观察空间（V 矩阵）→ 裁剪空间（P 矩阵）
+
+  URP 赋值：
+    o.pos = TransformObjectToHClip(v.positionOS.xyz);
+    // 等价于 TransformWorldToHClip(TransformObjectToWorld(v.positionOS.xyz))
+
+────────────────────────────────────────────────────────────────────────────────
+3.2  uv0 : TEXCOORD0 —— UV0 纹理坐标
+────────────────────────────────────────────────────────────────────────────────
+
+  原神角色贴图通常共用一套 UV（UV0），包括 Diffuse、Lightmap、Normalmap。
+
+  注意：
+    Ramp 贴图不用 UV0，而是用 Shader 计算出的 float2(rampU, rampV) 采样。
+    MetalMap（MatCap）不用 UV0，而是用视角空间法线生成 UV 采样。
+
+────────────────────────────────────────────────────────────────────────────────
+3.3  TtoW0/1/2 —— TBN 矩阵 + 世界坐标打包
+────────────────────────────────────────────────────────────────────────────────
+
+  用 12 个 float 同时传递了 TBN 矩阵（3×3）和世界空间位置（3 个 float）。
+
+  【存储方式（按矩阵行存储）】
+    TtoW0 = float4(T.x, B.x, N.x, posWS.x)
+    TtoW1 = float4(T.y, B.y, N.y, posWS.y)
+    TtoW2 = float4(T.z, B.z, N.z, posWS.z)
+    xyz = TBN 矩阵一行  /  w = 世界空间位置
+
+  【顶点阶段赋值代码（URP 推荐写法）】
+    float3 posWS   = TransformObjectToWorld(v.positionOS.xyz);
+    float3 nDirWS  = normalize(TransformObjectToWorldNormal(v.normal));
+    float3 tDirWS  = normalize(TransformObjectToWorldDir(v.tangent.xyz));
+
+    // ★ Gram-Schmidt 正交化：让 T 与 N 严格正交
+    tDirWS = normalize(tDirWS - nDirWS * dot(nDirWS, tDirWS));
+
+    // 处理切线符号和模型负缩放
+    float tangentSign = v.tangent.w * GetOddNegativeScale();
+    float3 bDirWS = cross(nDirWS, tDirWS) * tangentSign;
+
+    o.TtoW0 = float4(tDirWS.x, bDirWS.x, nDirWS.x, posWS.x);
+    o.TtoW1 = float4(tDirWS.y, bDirWS.y, nDirWS.y, posWS.y);
+    o.TtoW2 = float4(tDirWS.z, bDirWS.z, nDirWS.z, posWS.z);
+
+  【片元阶段恢复代码】
+    // 恢复世界坐标
+    float3 posWS = float3(i.TtoW0.w, i.TtoW1.w, i.TtoW2.w);
+
+    // TBN 矩阵转换切线空间法线到世界空间（= TBN_Matrix × normalTS）
+    float3 nDirWS;
+    nDirWS.x = dot(i.TtoW0.xyz, nDirTS);
+    nDirWS.y = dot(i.TtoW1.xyz, nDirTS);
+    nDirWS.z = dot(i.TtoW2.xyz, nDirTS);
+    nDirWS   = normalize(nDirWS);
+
+  【为什么把位置打包在 w 分量？】
+    TEXCOORD 插值器数量有限（通常最多 8 个）。
+    TBN 矩阵需要 3 个 float4（TEXCOORD1/2/3），位置塞进 w 分量可以节省一个插值器。
+
+  【转换后 nDirWS 服务于哪些计算？】
+    NdotL  = dot(nDirWS, lDirWS)   → Ramp 横轴采样（明暗）
+    NdotV  = dot(nDirWS, vDirWS)   → 菲涅尔边缘光范围
+    NdotH  = dot(nDirWS, hDirWS)   → Blinn-Phong 高光形状
+    nDirVS = mul(UNITY_MATRIX_V, nDirWS) → 金属 MatCap 反射 UV
+
+  【关于 Gram-Schmidt 正交化的必要性】
+    模型经过非均匀缩放后，T 和 N 变换方式不同（法线用逆转置矩阵）。
+    如果不做正交化，TBN 不是正交基底，法线转换结果会扭曲、光照异常。
+
+    公式：T' = normalize(T - N × dot(N, T))
+    意义：从 T 中减去它在 N 方向上的投影，让 T 和 N 严格垂直。
+
+
+================================================================================
+第四章   Properties 参数完整解析
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+4.1  参数分组总览
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────────┬─────────────────────────────────────────────────────┐
+  │ 分组         │ 包含参数                                            │
+  ├──────────────┼─────────────────────────────────────────────────────┤
+  │ 类型开关     │ _isFace（面板叫 isFace）                            │
+  │ 基础色贴图   │ _Diffuse                                            │
+  │ 边缘光       │ _fresnel, _fresnelPower                             │
+  │ 透明/自发光  │ _diffuseA, _Cutoff, _glow（HDR）, _flicker          │
+  │ Lightmap控制 │ _lightmap, _bright, _grey, _dark                    │
+  │ 法线         │ _bumpMap, _bumpScale                                │
+  │ Ramp 阴影    │ _ramp, _dayAndNight, _lightmapA0~A4                 │
+  │ 高光/金属    │ _metalMap, _gloss, _glossStrength, _metalMapColor   │
+  │ 描边         │ _outline, _outlineColor0~4                          │
+  └──────────────┴─────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+4.2  命名混淆详细对照表
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌────────────────┬─────────────────────┬──────────────────────────────────────┐
+  │ 原变量名       │ 建议改名            │ 真实含义和混淆原因                   │
+  ├────────────────┼─────────────────────┼──────────────────────────────────────┤
+  │ _isFace        │ 本名已较清晰        │ Toggle: 0=身体逻辑，1=脸部逻辑       │
+  │ _Diffuse       │ _BaseMap            │ Diffuse 是老叫法，现代 URP 叫 BaseMap│
+  │ _lightmap      │ _ILMMap             │ 极易误解为场景烘焙 Lightmap！        │
+  │                │                     │ 实际是角色材质控制图（ILM）          │
+  │ _bumpMap       │ _NormalMap          │ Unity 历史命名，实际是切线空间法线图 │
+  │ _ramp          │ _ShadowRamp         │ 变量名太短，面板名 Shadow_Ramp 更清楚│
+  │ _dayAndNight   │ _IsDay              │ 字面"昼和夜"，不如"是否白天"直观    │
+  │ _lightmapA0~4  │ _RampLayer_X        │ 完全看不出是"A通道值→Ramp行号的映射"│
+  │ _gloss         │ _SpecularPower      │ 中文叫"高光范围"但数值越大高光越小！ │
+  │                │                     │ 含义与名字方向相反                   │
+  │ _glossStrength │ _SpecularIntensity  │ 较直观，高光整体强度                 │
+  │ _metalMap      │ _MetalMatCap        │ 易与"金属 Mask 图"混淆               │
+  │ _fresnel       │ _RimPower           │ 控制的是 pow 指数（边缘光范围）      │
+  │ _fresnelPower  │ _RimIntensity       │ 边缘光强度                           │
+  └────────────────┴─────────────────────┴──────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+4.3  _bright / _grey / _dark 的含义
+────────────────────────────────────────────────────────────────────────────────
+
+  这三个参数控制身体的色阶分布，参与 Ramp 横轴的采样映射。
+
+  _dark  （暗面范围）：
+    用于 smoothstep 的第二个参数（上界），控制暗面到亮面的过渡宽度。
+    值越大，进入亮面所需的 NdotL 越高，阴影面积越大。
+
+  _grey  （灰面范围）：
+    控制明暗过渡宽度。值越大，明暗边界越柔和；值越小，边界越硬。
+    可以超过 1.0，用来扩大中间调范围。
+
+  _bright（亮面范围/阈值）：
+    控制哪些像素被认定为亮面。halfLambert >= _bright 时才认定为亮面。
+    接近 1.0 说明只有极强受光才算亮面。
+
+  在代码里的使用：
+    float halfLambert = smoothstep(0.0, _grey, NdotL + _dark) * lightMask;
+    float brightMask  = step(_bright, halfLambert);
+
+
+================================================================================
+第五章   五张贴图详解
+================================================================================
+
+════════════════════════════════════════════════════════
+5.1  _Diffuse —— 基础色贴图（BaseMap / Albedo）
+════════════════════════════════════════════════════════
+
+  【RGB 通道：角色所有表面的原始颜色】
+    亮面颜色 ≈ Diffuse.rgb（接近贴图本身颜色）
+    暗面颜色  = Diffuse.rgb × Ramp（由 Ramp 负责修改暗部色调）
+
+    为什么亮面不被主光颜色大幅改变：
+    NPR 角色的亮面必须保持干净的色块感。若亮面被真实光照染色，
+    角色会随场景光源颜色剧烈变化，失去稳定的二次元视觉风格。
+
+  【Alpha 通道（由 _diffuseA 参数控制用途）】
+    _diffuseA = 0 → 不使用 Alpha
+    _diffuseA = 1 → Alpha 作为透明裁剪（Cutout）
+                    代码：clip(diffuse.a - _Cutoff);
+                    用途：头发片锯齿边缘、蕾丝镂空、飘带轮廓
+    _diffuseA = 2 → Alpha 作为自发光遮罩（Emission Mask）
+                    效果：Alpha 较亮的区域发光，其他区域不发光
+                    用途：神之眼、元素纹路、发光花纹
+
+  【为什么用 Alpha Clip 而不是半透明 Blend？】
+    Alpha Clip：不需要处理透明排序，写入深度缓冲，头发层次关系正确。
+    半透明 Blend：多层堆叠时排序极难处理，容易产生穿插错误。
+
+════════════════════════════════════════════════════════
+5.2  _lightmap —— 身体 ILM 控制图（最核心！）
+════════════════════════════════════════════════════════
+
+  ⚠️ 重要澄清：
+    _lightmap 不是 Unity 场景烘焙 Lightmap！
+    它是角色专属的材质控制图，有时也叫 ILM Map：
+    I = Illumination（高光控制）
+    L = Layer（Ramp 分层 / 材质分区）
+    M = Material（材质参数）
+
+  ┌──────────┬────────────────────────────────────────────────────────────┐
+  │ R 通道   │ 高光强度区域 / 金属区域遮罩                               │
+  ├──────────┼────────────────────────────────────────────────────────────┤
+  │ G 通道   │ AO / 固定阴影 / 常驻暗部（手绘结构阴影）                  │
+  ├──────────┼────────────────────────────────────────────────────────────┤
+  │ B 通道   │ 高光细节遮罩 / 不同区域高光强弱控制                       │
+  ├──────────┼────────────────────────────────────────────────────────────┤
+  │ A 通道   │ Ramp 分层 / 材质类型索引（最重要！不是透明度！）          │
+  └──────────┴────────────────────────────────────────────────────────────┘
+
+  ────────────────────────────
+  R 通道 —— 高光 / 金属区域
+  ────────────────────────────
+    高光：spec *= lightmap.r
+    金属：float metalMask = step(0.9, lightmap.r);  // R >= 0.9 才是金属
+    不这样做：皮肤像塑料、布料像橡胶、所有材质高光一样。
+
+  ────────────────────────────
+  G 通道 —— AO / 固定阴影
+  ────────────────────────────
+    存储手绘的常驻暗部：衣服褶皱、腋下遮挡、腰带下方、袖口内侧、裙摆折叠等。
+    参与计算：lightMask = smoothstep(0.2, 0.3, lightmap.g);
+    不这样做：强光从正面打时，所有结构细节消失，角色变成气球一样的平面。
+
+  ────────────────────────────
+  B 通道 —— 高光细节
+  ────────────────────────────
+    specular *= lightmap.b;
+    让丝绸高光强、粗布高光弱、皮革高光中等，体现材质差异。
+
+  ────────────────────────────
+  A 通道 —— Ramp 分层（最重要！）
+  ────────────────────────────
+    ⚠️ A 通道不是透明度！是材质类型索引，决定采样 Ramp 贴图的哪一行。
+
+    通常由美术写入 5 种固定值：
+    ┌──────────────┬──────────────────┬──────────────┐
+    │ 参数         │ A 通道值         │ 对应材质     │
+    ├──────────────┼──────────────────┼──────────────┤
+    │ _lightmapA0  │ 1.0              │ 皮肤/头发    │
+    │ _lightmapA1  │ 0.7              │ 丝绸/软布料  │
+    │ _lightmapA2  │ 0.5              │ 金属/特殊    │
+    │ _lightmapA3  │ 0.3              │ 软材质（毛绒）│
+    │ _lightmapA4  │ 0.0              │ 硬材质（塑料）│
+    └──────────────┴──────────────────┴──────────────┘
+
+    为什么不硬编码？
+    不同角色导出时 A 通道分配和 Ramp 行顺序可能不同，
+    暴露为参数让美术可以在 Inspector 里灵活调整对应关系。
+
+    不做 Ramp 分层的后果：
+    所有材质暗部色调完全一样，皮肤和衣服暗部颜色相同，材质层次极低。
+
+════════════════════════════════════════════════════════
+5.3  _ramp —— Shadow Ramp 阴影色带贴图
+════════════════════════════════════════════════════════
+
+  【Ramp 贴图结构】
+    U 方向（横轴）：明暗程度
+      U=0 → 最暗颜色  /  U=0.5 → 灰面过渡色  /  U=1 → 亮面颜色
+
+    V 方向（纵轴）：材质类型（由 lightmap.a 决定）
+      V=0.95  皮肤/头发 Ramp
+      V=0.85  丝绸/布料 Ramp
+      V=0.75  金属/特殊 Ramp
+      V=0.65  软材质 Ramp
+      V=0.55  硬材质 Ramp
+      （纵向可以上下分白天/夜晚两套，共 10 条色带）
+
+  【Ramp V 坐标计算公式】
+    rampV = _lightmapA * -0.1 + 1.05 - rampOffset
+    _lightmapA = 1 → V = 0.95
+    _lightmapA = 2 → V = 0.85
+    _lightmapA = 3 → V = 0.75
+    _lightmapA = 4 → V = 0.65
+    _lightmapA = 5 → V = 0.55
+
+  【昼夜切换 _dayAndNight 的意义】
+    白天 Ramp：暗部颜色偏暖/中性（符合日光下的暖色阴影）
+    夜晚 Ramp：暗部颜色偏冷蓝/冷紫（符合月光夜晚的冷色阴影）
+    _dayAndNight = 1（白天）→ rampOffset = 0，采 V ≥ 0.55 区域
+    _dayAndNight = 0（夜晚）→ rampOffset = 0.5，采 V < 0.55 区域
+
+  【贴图设置建议】
+    Filter Mode：Bilinear（软边）或 Point（硬边卡通）
+    Wrap Mode：Clamp
+    关闭 Mipmap（防止不同条带互相串色）
+    尽量不压缩（防止色带污染）
+
+  【不使用 Ramp 直接变暗的后果】
+    暗部发灰，没有色彩倾向；皮肤没有温润感；金属没有冷硬感；
+    所有材质暗部颜色一样，失去材质层次；失去二次元大色块感。
+
+════════════════════════════════════════════════════════
+5.4  _bumpMap —— 法线贴图（Normalmap）
+════════════════════════════════════════════════════════
+
+  给身体表面增加微观细节，让衣服褶皱、饰品凹凸在光照中产生细节变化。
+
+  【法线贴图存储的是什么？】
+    切线空间法线。R=X偏移，G=Y偏移，B=Z方向（通常偏蓝色，因为大部分法线朝上）。
+    整体偏蓝是因为 B 通道（Z 方向）较强，意味着"表面基本正对法线方向"。
+
+  【为什么需要 TBN 矩阵转换？】
+    法线贴图里的方向是相对于"模型表面局部坐标系"的，
+    光照计算需要的是"世界坐标系"里的法线，所以必须用 TBN 矩阵做坐标变换。
+
+  【完整转换过程】
+    步骤 1：采样并解码
+      float3 nDirTS = UnpackNormal(SAMPLE_TEXTURE2D(_bumpMap, sampler_bumpMap, i.uv0));
+      // UnpackNormal 把 [0,1] 解码回 [-1,+1]
+
+    步骤 2：缩放法线强度
+      nDirTS.xy *= _bumpScale;
+      nDirTS.z = sqrt(1.0 - saturate(dot(nDirTS.xy, nDirTS.xy)));
+      nDirTS = normalize(nDirTS);
+
+    步骤 3：TBN 转换到世界空间
+      float3 nDirWS;
+      nDirWS.x = dot(i.TtoW0.xyz, nDirTS);
+      nDirWS.y = dot(i.TtoW1.xyz, nDirTS);
+      nDirWS.z = dot(i.TtoW2.xyz, nDirTS);
+      nDirWS = normalize(nDirWS);
+
+  【NPR 里法线贴图的特殊注意事项】
+    ① 法线强度不能过大！
+       过强会让 Ramp 明暗分界在细节处碎裂，整体看起来"脏"。
+    ② 脸部通常不用法线贴图（或 _bumpScale ≈ 0）
+       脸部阴影应该由 FaceLightmap / SDF 控制，法线贴图会产生杂乱阴影。
+    ③ 二次元角色法线应比写实角色克制。
+
+  【_bumpMap 命名来源】
+    Unity 早期把 Bump Map（高度图）和 Normal Map（法线图）混用这个名字，
+    _BumpMap 实际上存储的是 Normal Map，命名是历史遗留。
+
+════════════════════════════════════════════════════════
+5.5  _metalMap —— 金属 MatCap 贴图
+════════════════════════════════════════════════════════
+
+  【MatCap 是什么？】
+    Material Capture（材质捕获）。
+    把世界空间法线转换到视角空间，用法线 XY 分量生成 UV，
+    用这个 UV 采样预制反射图，模拟随视角变化的金属光泽。
+
+  【为什么不用真实 PBR 金属？】
+    ┌────────────────────────────────┬────────────────────────────────────┐
+    │ PBR 金属的问题                  │ MatCap 金属的优势                  │
+    ├────────────────────────────────┼────────────────────────────────────┤
+    │ 需要反射探针和 IBL 环境贴图    │ 不依赖任何场景环境                 │
+    │ 不同场景下金属表现不一致       │ 金属外观稳定，不随场景变化         │
+    │ 容易破坏二次元风格的稳定感     │ 完全由美术控制 MatCap 图形态       │
+    │ 性能开销更大                   │ 非常轻量，只是一次贴图采样         │
+    └────────────────────────────────┴────────────────────────────────────┘
+
+  【_metalMapColor 的作用】
+    对金属反射结果整体染色：偏蓝=冷钢铁，偏黄=金色饰品，白=保持原始颜色。
+
+  【CBUFFER 类型注意事项】
+    Properties 里是 color（float4），CBUFFER 里必须声明 float4 _metalMapColor;
+    使用时取 _metalMapColor.rgb，避免类型不一致引发 SRP Batcher 警告。
+
+
+================================================================================
+第六章   光照向量体系（代码准备）
+================================================================================
+
+在所有光照计算开始之前，需要先准备好以下向量，它们是后续所有模块的输入基础。
+
+【代码】
+  Light mlight = GetMainLight();
+
+  // 主光源方向（平行光，从光源指向物体）
+  float3 lDirWS = normalize(mlight.direction);
+
+  // 观察方向（从当前像素指向摄像机）
+  float3 vDirWS = normalize(_WorldSpaceCameraPos.xyz - posWS.xyz);
+
+  // 观察空间法线（用于 MatCap 金属反射采样）
+  // (float3x3) 只取旋转部分，去掉平移，因为法线是方向向量
+  float3 nDirVS = normalize(mul((float3x3)UNITY_MATRIX_V, nDirWS));
+
+  // 半角向量（观察方向和光照方向的角平分线，用于 Blinn-Phong 高光）
+  float3 hDirWS = normalize(vDirWS + lDirWS);
+
+【三个核心点积】
+  float NdotL = dot(nDirWS, lDirWS);  // 法线与光照方向：决定受光强度（漫反射、Ramp）
+  float NdotH = dot(nDirWS, hDirWS);  // 法线与半角方向：决定高光形状（Blinn-Phong）
+  float NdotV = dot(nDirWS, vDirWS);  // 法线与观察方向：决定边缘光范围（菲涅尔）
+
+【五个向量的空间关系示意】
+  摄像机
+    ↑  vDirWS（观察方向）
+    |
+    ●  ← 像素点（表面）
+    ↑  nDirWS（世界空间法线）
+    |
+    ↗  hDirWS（半程向量，vDir 和 lDir 的角平分线）
+    ↑  lDirWS（光照方向）
+
+    nDirVS = 观察空间法线（nDirWS 转到摄像机坐标系，用于 MatCap）
+
+【关于 NdotL 是否需要 saturate】
+  NdotL 通常不提前 saturate，因为后面用了：
+    smoothstep(0.0, _grey, NdotL + _dark)
+  如果提前 saturate(NdotL)，背光面的负值信息会被截断，
+  _dark 对暗部的调节空间会变小。
+
+【关于 Half-Lambert（NPR 常用）】
+  普通 Lambert：NdotL 范围 -1~+1（背光面为负数）
+  Half-Lambert：halfLambert = NdotL * 0.5 + 0.5，范围 0~1（背光面映射到 0~0.5）
+  Half-Lambert 不会出现负值，背光面有色彩信息，更适合 NPR。
+
+
+================================================================================
+第七章   Ramp 阴影系统
+================================================================================
+
+【功能】
+  用 NdotL 和 lightmap 的多个通道，从 Ramp 贴图中采样风格化阴影颜色。
+  不是传统 Lambert，而是卡通角色的多材质分区阴影系统。
+
+【固定阴影合并（AO × 实时阴影）】
+  在完整的渲染里，明暗值还需要结合 lightmap.g 的手绘固定阴影：
+    float shadowTerm = halfLambert * lightmap.g;
+  或者再合并实时阴影：
+    float shadowTerm = halfLambert * lightmap.g * shadowAttenuation;
+  这样固定结构阴影（褶皱等）始终存在，不会因光源变化消失。
+
+【完整优化版函数代码】
+
+  float3 ShadowRampStylized(float4 lightmap, float NdotL)
+  {
+      // 1. lightmap.g → 干净的受光遮罩
+      // lightmap.g <= 0.2 → 0，>= 0.3 → 1，中间平滑过渡
+      float lightMask = smoothstep(0.2, 0.3, lightmap.g);
+
+      // 2. 风格化半 Lambert
+      // _dark: 明暗偏移（越大亮面越多）  _grey: 明暗过渡宽度（越小越硬）
+      float halfLambert = smoothstep(0.0, _grey, NdotL + _dark) * lightMask;
+
+      // 3. 亮面遮罩
+      // halfLambert >= _bright → 亮面（brightMask=1）
+      // halfLambert < _bright  → 暗面（brightMask=0）
+      float brightMask = step(_bright, halfLambert);
+
+      // 4. 昼夜 Ramp 纵向偏移（无分支写法，避免 GPU 动态分支开销）
+      // _dayAndNight=0 → rampOffset=0.5（夜晚，采下半区）
+      // _dayAndNight=1 → rampOffset=0.0（白天，采上半区）
+      float rampOffset = (1.0 - _dayAndNight) * 0.5;
+
+      // 5. 各材质对应的 Ramp V 坐标
+      // 公式：_lightmapA * -0.1 + 1.05 - rampOffset
+      // _lightmapA=1→V=0.95 / 2→0.85 / 3→0.75 / 4→0.65 / 5→0.55
+      float rampV0 = _lightmapA0 * -0.1 + 1.05 - rampOffset;
+      float rampV1 = _lightmapA1 * -0.1 + 1.05 - rampOffset;
+      float rampV2 = _lightmapA2 * -0.1 + 1.05 - rampOffset;
+      float rampV3 = _lightmapA3 * -0.1 + 1.05 - rampOffset;
+      float rampV4 = _lightmapA4 * -0.1 + 1.05 - rampOffset;
+
+      // 6. lightmap.a → 材质区域阶梯遮罩
+      // 0.0=材质0 / 0.3=材质1 / 0.5=材质2 / 0.7=材质3 / 1.0=材质4
+      float materialMask1 = step(0.25, lightmap.a);
+      float materialMask2 = step(0.45, lightmap.a);
+      float materialMask3 = step(0.65, lightmap.a);
+      float materialMask4 = step(0.95, lightmap.a);
+
+      // 7. 逐层替换 Ramp V 坐标
+      // lightmap.a < 0.25  → rampV0
+      // 0.25 ~ 0.45        → rampV1
+      // 0.45 ~ 0.65        → rampV2
+      // 0.65 ~ 0.95        → rampV3
+      // >= 0.95            → rampV4
+      float rampV = rampV0;
+      rampV = lerp(rampV, rampV1, materialMask1);
+      rampV = lerp(rampV, rampV2, materialMask2);
+      rampV = lerp(rampV, rampV3, materialMask3);
+      rampV = lerp(rampV, rampV4, materialMask4);
+
+      // 8. 采样 Ramp 贴图
+      // U=halfLambert（横向明暗） / V=rampV（纵向材质/昼夜分区）
+      float2 rampUV = float2(saturate(halfLambert), saturate(rampV));
+      float3 rampColor = SAMPLE_TEXTURE2D(_ramp, sampler_ramp, rampUV).rgb;
+
+      // 9. 亮面使用 halfLambert 灰度，暗面使用 Ramp 颜色
+      // halfLambert.xxx 等价于 float3(halfLambert, halfLambert, halfLambert)
+      float3 shadowRamp = lerp(rampColor, halfLambert.xxx, brightMask);
+
+      return shadowRamp;
+  }
+
+【调用】
+  float3 shadowCol = ShadowRampStylized(lightmap, NdotL);
+
+
+================================================================================
+第八章   Blinn-Phong 风格化高光
+================================================================================
+
+【原理：Blinn-Phong 高光公式】
+  specular = pow(saturate(NdotH), gloss)
+  NdotH 越接近 1（法线越对准半角），高光越强。
+  gloss 越大，高光越锐利集中；gloss 越小，高光越宽柔。
+
+【注意：_gloss 命名陷阱】
+  中文面板叫"高光范围"，但 pow(NdotH, N) 中 N 越大高光越小越锐！
+  _gloss 越大 = 高光范围越小（与名字方向相反）。
+
+【高光只出现在亮面的原因】
+  通过 NdotL + lightmap.g 算出 halfLambert，
+  再用 step(_bright, halfLambert) 生成亮面遮罩 brightMask，
+  specular *= brightMask，暗面高光被完全遮掉。
+  这符合卡通/二次元渲染风格，保持画面干净。
+
+【高光为什么乘 baseColor 而非白色？】
+  乘白色：高光斑点是纯白，在有色表面上很突兀，像白色塑料反光。
+  乘 baseColor：高光保持固有色调，更融合，更有材质感。
+
+【完整优化版函数代码】
+
+  float3 Spec(float NdotL, float NdotH, float4 lightmap, float3 baseColor)
+  {
+      // 1. 基础 Blinn-Phong 高光形状（推荐 _gloss 范围: 16~128）
+      float blinnPhong = pow(saturate(NdotH), _gloss);
+
+      // 2. lightmap.r：高光强度区域（0=无高光，1=完整高光）
+      float specMask = lightmap.r;
+
+      // 3. lightmap.b：高光细节（丝绸高，粗布低，皮革中等）
+      float specDetail = lightmap.b;
+
+      // 4. 初始高光 = 形状 × 区域 × 细节 × 整体强度
+      float3 specular = blinnPhong * specMask * specDetail * _glossStrength;
+
+      // 5. 乘固有色染色（卡通风格，非严格物理正确）
+      specular *= baseColor;
+
+      // 6. lightmap.g → 受光遮罩
+      float lightMask = smoothstep(0.2, 0.3, lightmap.g);
+
+      // 7. 风格化半 Lambert（和 Ramp 相同逻辑）
+      float halfLambert = smoothstep(0.0, _grey, NdotL + _dark) * lightMask;
+
+      // 8. 亮面遮罩：只在亮面显示高光
+      float brightMask = step(_bright, halfLambert);
+
+      // 9. 高光只保留在亮面
+      specular *= brightMask;
+
+      return specular;
+  }
+
+【关于 nDirVS 参数】
+  旧版函数可能传入 nDirVS，但普通 Blinn-Phong 高光不需要观察空间法线。
+  高光随视角变化是因为 vDirWS 参与了 hDirWS 计算，而不是因为 nDirVS。
+  建议删除 Spec 函数中未使用的 nDirVS 参数。
+
+【调用】
+  float3 specularCol = Spec(NdotL, NdotH, lightmap, baseColor);
+
+
+================================================================================
+第九章   MatCap 金属反射
+================================================================================
+
+【为什么用观察空间法线】
+  观察空间法线的 XY 分量反映法线在屏幕方向上的投影。
+  当摄像机视角变化时，观察空间法线也变化，
+  采样到的 MetalMap 区域随之变化，形成"金属光泽随视角移动"的效果。
+  这就是 MatCap 的核心原理。
+
+【金属区域分区逻辑】
+  lightmap.r < 0.9  → 非金属区域（普通漫反射）
+  lightmap.r >= 0.9 → 金属区域（MatCap 反射，不显示普通漫反射）
+  两者互补，用 metalMask 和 nonMetalMask 控制。
+
+【完整优化版函数代码】
+
+  float3 MetalStylized(float3 nDirVS, float4 lightmap, float3 baseColor)
+  {
+      // 1. 金属区域遮罩（lightmap.r >= 0.9 才显示金属）
+      float metalMask = step(0.9, lightmap.r);
+
+      // 2. MatCap UV：观察空间法线 XY 从 -1~1 映射到 0~1
+      float2 metalUV = nDirVS.xy * 0.5 + 0.5;
+
+      // 3. 采样金属贴图（只取 R 通道作为反射混合权重）
+      float metalMapValue = SAMPLE_TEXTURE2D(_metalMap, sampler_metalMap, metalUV).r;
+
+      // 4. metalMapValue=0 → _metalMapColor（金属反射色）
+      //    metalMapValue=1 → baseColor（固有色）
+      float3 metalColor = lerp(_metalMapColor.rgb, baseColor, metalMapValue);
+
+      // 5. 屏蔽非金属区域
+      metalColor *= metalMask;
+
+      return metalColor;
+  }
+
+【MatCap 和 Blinn-Phong 高光的区别】
+  Blinn-Phong：pow(saturate(NdotH), gloss)，数学计算出的圆形高光斑。
+  MatCap：用观察空间法线 UV 从贴图里取颜色，美术控制强，可以是条状、带状反光。
+  两者都会随视角变化，但原理完全不同。
+
+【调用】
+  float3 metalCol = MetalStylized(nDirVS, lightmap, baseColor);
+
+
+================================================================================
+第十章   菲涅尔边缘光
+================================================================================
+
+【菲涅尔原理】
+  真实世界中，水面或玻璃在斜视角下反射更强，正视角下透明度更高。
+  在角色 Shader 里简化为：边缘光强度 = pow(1 - NdotV, _fresnel)
+
+  NdotV ≈ 1（正对摄像机）→ 1 - NdotV ≈ 0 → 没有边缘光
+  NdotV ≈ 0（接近轮廓）  → 1 - NdotV ≈ 1 → 边缘光最强
+
+【硬边版（卡通风格）vs 软边版（写实风格）】
+  硬边版：step(0.5, fresnelMask)  → 边缘光出现的边界很硬，赛璐璐卡通风格
+  软边版：直接使用 fresnelMask    → 边缘光从中心向外柔和渐变，插画或写实风格
+
+【边缘光为什么乘 baseColor？】
+  和高光一样，乘 baseColor 让边缘光带有材质颜色，更融合。
+  红色衣服边缘偏红，蓝色头发边缘偏蓝。
+
+【完整优化版函数代码】
+
+  // 硬边卡通版
+  float3 EdgeLightFresnel(float NdotV, float3 baseColor)
+  {
+      // 1. 菲涅尔遮罩（_fresnel 越大范围越窄）
+      float fresnelMask = pow(saturate(1.0 - NdotV), _fresnel);
+
+      // 2. 硬切边缘遮罩（卡通风格）
+      float edgeMask = step(0.5, fresnelMask);
+
+      // 3. 边缘光颜色（乘固有色，让边缘光带材质颜色）
+      float3 edgeColor = edgeMask * _fresnelPower * baseColor;
+
+      return edgeColor;
+  }
+
+【调用】
+  float NdotV = dot(nDirWS, vDirWS);
+  float3 edgeCol = EdgeLightFresnel(NdotV, baseColor);
+
+
+================================================================================
+第十一章  屏幕深度边缘光（进阶）
+================================================================================
+
+【和菲涅尔边缘光的区别】
+  ┌────────────────┬──────────────────────────┬──────────────────────────────┐
+  │ 类型            │ 依据                      │ 适合效果                     │
+  ├────────────────┼──────────────────────────┼──────────────────────────────┤
+  │ 菲涅尔边缘光    │ NdotV（法线与视线）       │ 角色轮廓提亮                 │
+  │ 屏幕深度边缘    │ 相邻像素深度差            │ 遮挡边缘 / 物体交界线        │
+  │ 法线边缘检测    │ 屏幕法线差                │ 模型折角                     │
+  └────────────────┴──────────────────────────┴──────────────────────────────┘
+
+【接入所需修改】
+  // 1. 额外 include
+  #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+
+  // 2. Varyings 结构体加
+  float4 screenPos : TEXCOORD4;
+
+  // 3. 顶点着色器加
+  o.screenPos = ComputeScreenPos(o.pos);
+
+【函数代码】
+
+  float3 ScreenDepthEdgeLight(float4 screenPos, float3 baseColor)
+  {
+      float2 screenUV = screenPos.xy / screenPos.w;
+      float centerDepth = LinearEyeDepth(SampleSceneDepth(screenUV), _ZBufferParams);
+
+      float2 texelSize = _ScreenParams.zw - 1.0;
+      float2 offset    = texelSize * _DepthEdgeWidth;
+
+      float depthL = LinearEyeDepth(SampleSceneDepth(screenUV + float2(-offset.x, 0)), _ZBufferParams);
+      float depthR = LinearEyeDepth(SampleSceneDepth(screenUV + float2( offset.x, 0)), _ZBufferParams);
+      float depthU = LinearEyeDepth(SampleSceneDepth(screenUV + float2(0,  offset.y)), _ZBufferParams);
+      float depthD = LinearEyeDepth(SampleSceneDepth(screenUV + float2(0, -offset.y)), _ZBufferParams);
+
+      float depthDiff = 0.0;
+      depthDiff = max(depthDiff, abs(centerDepth - depthL));
+      depthDiff = max(depthDiff, abs(centerDepth - depthR));
+      depthDiff = max(depthDiff, abs(centerDepth - depthU));
+      depthDiff = max(depthDiff, abs(centerDepth - depthD));
+
+      float edgeMask = smoothstep(_DepthEdgeThreshold, _DepthEdgeThreshold * 2.0, depthDiff);
+      float3 edgeColor = edgeMask * _DepthEdgeColor.rgb * _DepthEdgeStrength;
+
+      return edgeColor;
+  }
+
+【注意事项】
+  1. 需要在 URP Asset / Renderer 中开启 Depth Texture。
+  2. 此效果放在物体自身材质里，只在该物体绘制区域生效。
+     全屏统一描边建议用 Renderer Feature 或后处理 Fullscreen Pass。
+  3. 透明物体可能不写深度，采样结果可能不准。
+
+
+================================================================================
+第十二章  自发光闪烁
+================================================================================
+
+【核心：sin 闪烁原理】
+  sin(_Time.w * _flicker)     产生 -1~1 的周期变化
+  sin * 0.5 + 0.5             映射到 0~1，确保自发光不会为负值
+  _flicker 越大，闪烁越快；越小，闪烁越慢。
+
+【_glow 是 HDR 颜色】
+  Properties 里 [HDR]_glow 允许设置亮度大于 1 的颜色。
+  结合后处理 Bloom，可以让发光区域产生泛光效果。
+  CBUFFER 里必须声明 float4 _glow，使用时取 .rgb。
+
+【让 Bloom 生效的条件】
+  1. _glow.rgb 亮度设置 > 1（例如 (2,2,2) 或 (5,3,1)）
+  2. 项目使用 HDR 渲染（Camera 和 URP Asset 里开启 HDR）
+  3. Volume 或相机后处理中开启 Bloom
+
+【完整优化版函数代码】
+
+  float3 EmissionStylized(float3 baseColor, float diffuseA)
+  {
+      // 1. 平滑处理 Alpha 遮罩
+      float glowMask = smoothstep(0.0, 1.0, diffuseA);
+
+      // 2. 周期闪烁，范围 0~1
+      float flicker = sin(_Time.w * _flicker) * 0.5 + 0.5;
+
+      // 3. 自发光颜色 = 固有色 × HDR 自发光颜色 × 闪烁强度 × 遮罩
+      float3 emission = baseColor * _glow.rgb * flicker * glowMask;
+
+      return emission;
+  }
+
+【结合 _diffuseA 参数控制模式（无分支写法）】
+  float emissionMode = step(1.5, _diffuseA);    // _diffuseA >= 1.5 时启用自发光
+  float3 emissionCol = EmissionStylized(baseColor, diffuseA) * emissionMode;
+
+【Cutout 透明模式（_diffuseA ≈ 1）】
+  float alphaClipMode = step(0.5, _diffuseA) * (1.0 - step(1.5, _diffuseA));
+  clip(lerp(1.0, diffuseA - _Cutoff, alphaClipMode));
+  // alphaClipMode=0 时不裁剪，alphaClipMode=1 时启用 Cutout 裁剪
+
+【调用】
+  float emissionMode = step(1.5, _diffuseA);
+  float3 emissionCol = EmissionStylized(baseColor, diffuseA) * emissionMode;
+
+
+================================================================================
+第十三章  Body 合成模块 —— 所有子模块的总入口
+================================================================================
+
+【金属与非金属的分区逻辑】
+  lightmap.r >= 0.9 → 金属区域（显示 metal，不显示普通 diffuse）
+  lightmap.r < 0.9  → 非金属区域（显示 diffuse，不显示 metal）
+
+  金属和非金属的光照响应完全不同：
+  非金属（布料/皮肤）→ Lambert 漫反射 + 镜面高光
+  金属               → 强烈的环境反射（MatCap），几乎没有漫反射
+
+  代码：
+    float metalMask    = step(0.9, lightmap.r);
+    float nonMetalMask = 1.0 - metalMask;
+
+【各模块叠加方式一览】
+  diffuse   = baseColor × ramp × lightColor × nonMetalMask
+  specular  = Blinn-Phong × lightmap.r × lightmap.b × baseColor × brightMask
+  metal     = MatCap采样 × metalMask
+  fresnel   = pow(1-NdotV, _fresnel) × step × baseColor
+  emission  = baseColor × _glow × sin(time) × diffuseAlphaMask
+
+【完整 Body 函数代码】
+
+  float3 Body(
+      float NdotL,
+      float NdotH,
+      float NdotV,
+      float4 lightmap,
+      float3 baseColor,
+      float3 nDirVS,
+      float diffuseA,
+      float3 lightColor
+  )
+  {
+      // 1. Ramp 阴影
+      float3 ramp = ShadowRampStylized(lightmap, NdotL);
+
+      // 2. 金属/非金属分区遮罩
+      float metalMask    = step(0.9, lightmap.r);
+      float nonMetalMask = 1.0 - metalMask;
+
+      // 3. 非金属漫反射
+      // 乘主光颜色 + 乘 nonMetalMask（金属区域不显示漫反射）
+      float3 diffuse = baseColor * ramp * lightColor;
+      diffuse *= nonMetalMask;
+
+      // 4. Blinn-Phong 风格化高光
+      float3 specular = Spec(NdotL, NdotH, lightmap, baseColor);
+
+      // 5. MatCap 金属反射
+      float3 metal = MetalStylized(nDirVS, lightmap, baseColor);
+
+      // 6. 菲涅尔边缘光
+      float3 fresnel = EdgeLightFresnel(NdotV, baseColor);
+
+      // 7. 自发光（_diffuseA >= 1.5 时启用）
+      float emissionMode = step(1.5, _diffuseA);
+      float3 emission = EmissionStylized(baseColor, diffuseA) * emissionMode;
+
+      // 8. 最终合成：漫反射 + 金属 + 高光 + 边缘光 + 自发光
+      float3 body = diffuse + metal + specular + fresnel + emission;
+
+      return body;
+  }
+
+【高光是否在金属区域显示】
+  当前默认：高光在金属区域也叠加。
+  若希望金属区域只用 MatCap：specular *= nonMetalMask;
+  若保留少量高光：specular *= lerp(0.3, 1.0, nonMetalMask);
+
+【若希望金属区域保留少量底色】
+  diffuse *= lerp(1.0, 0.2, metalMask);   // 金属区域保留 20% 漫反射底色
+
+
+================================================================================
+第十四章  完整 frag 片元着色器流程
+================================================================================
+
+【流程图】
+  采样 Diffuse → baseColor / diffuseA
+        ↓
+  Alpha 裁剪判断（_diffuseA ≈ 1 时）
+        ↓
+  采样 LightMap → lightmap.rgba
+        ↓
+  采样 NormalMap → 解码 → 强度调整 → TBN 转换 → nDirWS
+        ↓
+  恢复 posWS（从 TtoW.w 分量）
+        ↓
+  计算光照向量 lDirWS / vDirWS / nDirVS / hDirWS
+        ↓
+  计算点积 NdotL / NdotH / NdotV
+        ↓
+  调用 Body（Ramp + 金属 + 高光 + 边缘光 + 自发光）
+        ↓
+  最终颜色压暗（× 0.7）
+        ↓
+  return half4(col, diffuseA)
+
+【完整 frag 代码参考】
+
+  half4 frag(Varyings i) : SV_Target
+  {
+      // 1. 采样基础贴图
+      float4 diffuseTex = SAMPLE_TEXTURE2D(_Diffuse, sampler_Diffuse, i.uv0);
+      float3 baseColor  = diffuseTex.rgb;
+      float  diffuseA   = diffuseTex.a;
+
+      float4 lightmap = SAMPLE_TEXTURE2D(_lightmap, sampler_lightmap, i.uv0);
+
+      // 2. Alpha 裁剪（_diffuseA ≈ 1 时启用 Cutout）
+      float alphaClipMode = step(0.5, _diffuseA) * (1.0 - step(1.5, _diffuseA));
+      clip(lerp(1.0, diffuseA - _Cutoff, alphaClipMode));
+
+      // 3. 法线贴图：切线空间法线
+      float3 nDirTS = UnpackNormal(SAMPLE_TEXTURE2D(_bumpMap, sampler_bumpMap, i.uv0));
+      nDirTS.xy *= _bumpScale;
+      nDirTS.z   = sqrt(1.0 - saturate(dot(nDirTS.xy, nDirTS.xy)));
+      nDirTS     = normalize(nDirTS);
+
+      // 4. TBN 矩阵：切线空间法线 → 世界空间法线
+      float3 nDirWS;
+      nDirWS.x = dot(i.TtoW0.xyz, nDirTS);
+      nDirWS.y = dot(i.TtoW1.xyz, nDirTS);
+      nDirWS.z = dot(i.TtoW2.xyz, nDirTS);
+      nDirWS   = normalize(nDirWS);
+
+      // 5. 恢复世界空间顶点位置
+      float3 posWS = float3(i.TtoW0.w, i.TtoW1.w, i.TtoW2.w);
+
+      // 6. 光照向量
+      Light  mlight = GetMainLight();
+      float3 lDirWS = normalize(mlight.direction);
+      float3 vDirWS = normalize(_WorldSpaceCameraPos.xyz - posWS);
+      float3 nDirVS = normalize(mul((float3x3)UNITY_MATRIX_V, nDirWS));
+      float3 hDirWS = normalize(vDirWS + lDirWS);
+
+      // 7. 点积
+      float NdotL = dot(nDirWS, lDirWS);
+      float NdotH = dot(nDirWS, hDirWS);
+      float NdotV = dot(nDirWS, vDirWS);
+
+      // 8. Body 合成
+      float3 col = Body(
+          NdotL, NdotH, NdotV,
+          lightmap, baseColor, nDirVS,
+          diffuseA, mlight.color.rgb
+      );
+
+      // 9. 整体压暗
+      col *= 0.7;
+
+      return half4(col, diffuseA);
+  }
+
+【为什么自发光不乘主光颜色】
+  漫反射乘主光颜色，是因为漫反射受场景光照影响。
+  自发光是物体自身产生的光，不应该被主光颜色影响。
+  所以 emission 单独叠加，不乘 mlight.color.rgb。
+
+
+================================================================================
+第十五章  描边 Pass 详解 —— Inverted Hull + 多色描边
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+15.1  Inverted Hull 描边原理
+────────────────────────────────────────────────────────────────────────────────
+
+  步骤：
+    ① 把模型沿每个顶点法线方向向外扩大一点点（_outline 控制扩展量）
+    ② 只渲染这个外扩模型的背面（Cull Front）
+    ③ 外扩模型的正面被原始角色深度挡住，不可见
+    ④ 只有边缘位置，外扩模型的背面"露出来"，形成描边
+
+  顶点着色器核心：
+    positionOS.xyz += normalize(normalOS) * _outline;
+    o.positionCS    = TransformObjectToHClip(positionOS);
+
+  描边粗细控制：
+    _outline 越大 → 法线外扩越多 → 描边越粗。
+    但这是世界空间扩展量，远处描边细，近处描边粗（与视距有关）。
+
+  顶点色控制粗细（高级技巧）：
+    positionOS.xyz += normalOS * _outline * vertexColor.a;
+    在建模软件里绘制顶点 Alpha，精确控制各区域描边粗细。
+
+  片元着色器核心（根据 lightmap.a 分材质描边颜色）：
+    float4 lightmap = SAMPLE_TEXTURE2D(_lightmap, sampler_lightmap, i.uv0);
+
+    float3 outlineColor = _outlineColor0.rgb;   // 默认材质 0
+    float materialMask1 = step(0.25, lightmap.a);
+    float materialMask2 = step(0.45, lightmap.a);
+    float materialMask3 = step(0.65, lightmap.a);
+    float materialMask4 = step(0.95, lightmap.a);
+
+    outlineColor = lerp(outlineColor, _outlineColor1.rgb, materialMask1);
+    outlineColor = lerp(outlineColor, _outlineColor2.rgb, materialMask2);
+    outlineColor = lerp(outlineColor, _outlineColor3.rgb, materialMask3);
+    outlineColor = lerp(outlineColor, _outlineColor4.rgb, materialMask4);
+
+    return float4(outlineColor, 1.0);
+
+────────────────────────────────────────────────────────────────────────────────
+15.2  五种描边颜色的设计理由
+────────────────────────────────────────────────────────────────────────────────
+
+  原神风格不使用统一黑色描边，而是根据材质使用不同颜色。
+
+  ┌────────────────────────────┬──────────────────────────────────────────────┐
+  │ 材质区域（Lightmap.a）     │ 推荐描边颜色倾向和原因                      │
+  ├────────────────────────────┼──────────────────────────────────────────────┤
+  │ A=1.0  皮肤/头发           │ 深棕/暖暗色。黑色会让皮肤显脏，             │
+  │                            │ 暖棕色更接近皮肤阴影的延伸                  │
+  ├────────────────────────────┼──────────────────────────────────────────────┤
+  │ A=0.7  丝绸/布料           │ 灰蓝/浅紫灰。让描边成为材质暗部的延续      │
+  ├────────────────────────────┼──────────────────────────────────────────────┤
+  │ A=0.5  金属                │ 冷灰色/深蓝灰。金属边缘反光后的暗部偏冷   │
+  ├────────────────────────────┼──────────────────────────────────────────────┤
+  │ A=0.3  软材质              │ 接近材质固有色的深色。软材质描边应柔和      │
+  ├────────────────────────────┼──────────────────────────────────────────────┤
+  │ A=0.0  硬材质              │ 深色，边界清晰。硬材质描边可以更硬          │
+  └────────────────────────────┴──────────────────────────────────────────────┘
+
+  默认颜色（红/绿/蓝/黄/紫）是调试默认值，实际使用时必须改成上表的倾向色。
+
+  使用统一黑色描边的后果：
+    皮肤边缘太脏，看起来像画了黑眼圈；
+    白色衣服黑色线条太硬，没有柔和感；
+    整体更像粗犷卡通，而非原神细腻风格。
+
+
+================================================================================
+第十六章  脸部 vs 身体 —— 为什么要区分两套逻辑
+================================================================================
+
+  ┌────────────────┬────────────────────────────┬──────────────────────────────┐
+  │ 对比项         │ 身体（_isFace = 0）        │ 脸部（_isFace = 1）          │
+  ├────────────────┼────────────────────────────┼──────────────────────────────┤
+  │ 阴影来源       │ NdotL + Ramp               │ FaceLightmap / SDF 阈值图    │
+  │ _lightmap 用途 │ 身体 ILM 控制图            │ 脸部专属阴影贴图             │
+  │ 法线贴图       │ 使用，衣服褶皱细节         │ 极弱或不用                   │
+  │ Ramp 使用      │ 多行，5种材质分层          │ 通常固定皮肤 Ramp 行         │
+  │ _lightmapA0~4  │ 全部使用                   │ 通常只用皮肤对应行           │
+  └────────────────┴────────────────────────────┴──────────────────────────────┘
+
+【为什么脸部不能用普通 NdotL 光照】
+  脸部是模型里曲面最复杂的区域，直接用 NdotL + Ramp 会出现严重问题：
+  - 鼻子侧面产生不自然的鼻侧阴影
+  - 眼眶产生眼周黑圈
+  - 嘴角、人中产生杂乱细碎阴影
+  - 当光源从侧面打，脸上出现极难控制的不规则阴影形状
+
+  二次元角色的脸部阴影应该是"固定的好看形状"，
+  而不是"随物理法线和光源方向实时变化的真实阴影"。
+
+【脸部阴影的解决方案】
+  方案 A：FaceLightmap 方法
+    美术手绘一张专门的脸部阴影贴图，
+    直接存储"当光源在某个角度时，脸上应该出现什么形状的阴影"。
+    无论光源怎么动，阴影形状来自预制贴图，始终好看。
+
+  方案 B：SDF（有向距离场）方法（更常见于原神）
+    SDF Lightmap 的每个像素存储一个"光源角度阈值"。
+    当光源角度超过该阈值，该像素变暗；未超过时保持亮面。
+    阴影形状固定，但仍能随光源位置移动（从无到有的过渡），更自然。
+
+    SDF 核心逻辑（简化）：
+      float threshold  = sdfLightmap.r;
+      float lightAngle = 计算光源水平角度（0~1）;
+      float faceShadow = step(threshold, lightAngle);
+
+
+================================================================================
+第十七章  常见问题与注意事项
+================================================================================
+
+【问题 1：frag 里调用 shadow_ramp 报 undeclared identifier】
+  原因：定义的函数名是 ShadowRampStylized，调用写的是 shadow_ramp，名称不一致。
+  修复：float3 shadowCol = ShadowRampStylized(lightmap, NdotL);
+
+【问题 2：Pass 不渲染，画面没有输出】
+  原因：Tags{"LightMode"="Head"} 不是 URP 标准识别的 LightMode。
+  修复：Tags{"LightMode"="UniversalForward"}
+
+【问题 3：_metalMapColor 类型不一致导致 SRP Batcher 报警】
+  原因：Properties 里 color 对应 float4，CBUFFER 里声明成了 float3。
+  修复：CBUFFER 里改成 float4 _metalMapColor; 使用时取 .rgb。
+
+【问题 4：描边颜色也需要 float4】
+  原因：Properties 里 color 是 float4，CBUFFER 里的 _outlineColor0~4 也要 float4。
+  修复：float4 _outlineColor0; ... float4 _outlineColor4;
+
+【问题 5：nDirTS.z 重算后还需要 normalize】
+  原因：nDirTS.z = sqrt(1.0 - ...) 在数值上接近单位长度但不严格等于 1。
+  修复：在此之后加 nDirTS = normalize(nDirTS);
+
+【问题 6：自发光函数名 light 与 URP Light 结构体混淆】
+  修复：改名为 EmissionStylized 或 GlowEmission。
+
+【问题 7：diffsueA 拼写错误（应为 diffuseA）】
+  虽然不一定报错，但影响代码可读性，统一改为 diffuseA。
+
+【问题 8：_dayAndNight 用 if 分支实现效率低】
+  原因：GPU 不擅长动态分支，简单开关尽量用数学替代。
+  修复：float rampOffset = (1.0 - _dayAndNight) * 0.5;
+
+【问题 9：切线变换应用 TransformObjectToWorld 而非 TransformObjectToWorldDir】
+  原因：TransformObjectToWorld 包含平移，适合位置变换；
+        方向向量变换应该用 TransformObjectToWorldDir。
+  修复：float3 tDirWS = normalize(TransformObjectToWorldDir(v.tangent.xyz));
+
+【问题 10：模型有负缩放时副切线方向错误】
+  原因：v.tangent.w 只处理 UV 镜像，不处理模型负缩放。
+  修复：float tangentSign = v.tangent.w * GetOddNegativeScale();
+        float3 bDirWS = cross(nDirWS, tDirWS) * tangentSign;
+
+【问题 11：金属贴图采样中 float3 = texture.r 不规范】
+  原因：texture.r 是标量 float，语义不清晰。
+  修复：float metalMapValue = SAMPLE_TEXTURE2D(...).r;
+
+【问题 12：Spec 函数保留了未使用的 nDirVS 参数】
+  原因：Blinn-Phong 高光不需要观察空间法线，nDirVS 参数应当删除。
+  修复：float3 Spec(float NdotL, float NdotH, float4 lightmap, float3 baseColor)
+
+【Ramp 贴图采样设置建议】
+  Filter Mode：Bilinear（软边）或 Point（硬边卡通）
+  Wrap Mode：Clamp
+  关闭 Mipmap（防止不同条带互相串色）
+  尽量不压缩（防止色带污染）
+
+【屏幕深度边缘光的局限】
+  直接写在角色材质里，只能在该物体渲染区域生效。
+  全屏统一描边效果建议用 Renderer Feature 或后处理 Fullscreen Pass。
+
+
+================================================================================
+第十八章  总结速查表
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+18.1  身体贴图通道总览
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌────────────────────┬──────────────────────────┬───────────────────────────┐
+  │ 贴图 / 通道        │ 作用                     │ 美术效果                  │
+  ├────────────────────┼──────────────────────────┼───────────────────────────┤
+  │ Diffuse.rgb        │ 基础色                   │ 角色固有颜色              │
+  │ Diffuse.a          │ 透明/自发光 Mask          │ 镂空裁剪 或 发光区域      │
+  │ Lightmap.r         │ 高光/金属区域            │ 控制高光和金属反射范围    │
+  │ Lightmap.g         │ AO/固定阴影              │ 褶皱、遮挡常驻暗部        │
+  │ Lightmap.b         │ 高光细节                 │ 不同材质高光强弱差异      │
+  │ Lightmap.a         │ Ramp 材质分层（不是透明）│ 5种材质采不同 Ramp 行     │
+  │ Ramp 横向 U        │ 明暗程度                 │ 亮/灰/暗面的过渡颜色      │
+  │ Ramp 纵向 V        │ 材质类型                 │ 皮肤/布料/金属各自暗部色  │
+  │ Normal.rgb         │ 切线空间法线             │ 衣服褶皱、饰品凹凸细节    │
+  │ MetalMap（MatCap） │ 金属反射图案             │ 风格化固定反光            │
+  └────────────────────┴──────────────────────────┴───────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+18.2  渲染阶段速查
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────┬──────────────────────┬───────┬────────┬────────────────────────────┐
+  │ 顺序 │ LightMode            │ Cull  │ ZWrite │ 负责内容                   │
+  ├──────┼──────────────────────┼───────┼────────┼────────────────────────────┤
+  │ 1    │ UniversalForward     │ Back  │ On     │ 所有身体颜色（主体）       │
+  │ 2    │ GenshinBackFace      │ Front │ Off    │ 薄片模型背面               │
+  │ 3    │ GenshinOutline       │ Front │ Off    │ 轮廓描边（法线外扩）       │
+  └──────┴──────────────────────┴───────┴────────┴────────────────────────────┘
+
+  Pass 2/3 通过 Render Objects Renderer Feature 触发，需手动配置。
+
+────────────────────────────────────────────────────────────────────────────────
+18.3  最终颜色计算公式
+────────────────────────────────────────────────────────────────────────────────
+
+  finalColor =
+      Diffuse × Ramp( HalfLambert × AO, MaterialLayer ) × MainLightColor  ← 漫反射
+    + pow(NdotH, Gloss) × LightmapR × LightmapB × GlossStrength × Diffuse ← 高光
+    + MetalMatCap × LightmapR_Mask × MetalColor                            ← 金属
+    + pow(1-NdotV, RimPower) × RimIntensity × Diffuse                     ← 边缘光
+    + DiffuseAlpha × GlowColor × sin(Time × FlickerSpeed)                 ← 自发光
+
+  代码版本：
+    float3 col = diffuse + specular + metal + edge + emission;
+    col *= 0.7;
+
+────────────────────────────────────────────────────────────────────────────────
+18.4  参数推荐范围
+────────────────────────────────────────────────────────────────────────────────
+
+  【Ramp 阴影参数】
+    _grey          0.3 ~ 1.0       明暗过渡宽度（越大越柔）
+    _dark          -0.2 ~ 0.5     明暗偏移（越大亮面越多）
+    _bright        0.3 ~ 0.8      亮面阈值（越大亮面越少）
+    _dayAndNight   0 / 1           切换昼夜 Ramp（Toggle）
+    _lightmapA0~4  1 ~ 5           各材质 Ramp 条带编号
+
+  【高光参数】
+    _gloss         16 ~ 128        高光锐利程度（越大越小越锐）
+    _glossStrength 0 ~ 2           高光整体强度
+
+  【金属参数】
+    _metalMapColor 任意 RGB        金属反射基础颜色（偏冷=钢铁，偏暖=黄金）
+
+  【边缘光参数】
+    _fresnel       1.0 ~ 10.0     边缘光范围（越大越窄贴边）
+    _fresnelPower  0.0 ~ 2.0      边缘光强度（默认很小，0.02 左右）
+
+  【自发光参数】
+    _glow（HDR）   (1,1,1)~(5,5,5) 自发光颜色和强度（>1 才能触发 Bloom）
+    _flicker       0.1 ~ 5.0      闪烁速度（越大越快）
+    _diffuseA      0 / 1 / 2      Alpha 模式（0=不用 1=透明 2=发光）
+    _Cutoff        0.0 ~ 1.0      Cutout 透明阈值
+
+  【描边参数】
+    _outline       0.0 ~ 1.0      描边粗细
+    _outlineColor0~4 偏向材质深色  各材质区域描边颜色（不要用纯黑）
+
+────────────────────────────────────────────────────────────────────────────────
+18.5  为什么要这样做（一问一答速查）
+────────────────────────────────────────────────────────────────────────────────
+
+  Q：为什么不用真实光照？
+  A：真实光照让暗部发灰，破坏二次元大色块干净感，也让所有材质暗部颜色一样。
+
+  Q：为什么 Ramp 分那么多行？
+  A：皮肤/金属/布料暗部颜色完全不同，一条 Ramp 无法覆盖所有材质。
+
+  Q：为什么 Lightmap.a 不是透明度？
+  A：Alpha 通道被用来存材质分类索引，让 Ramp 能按材质分层采样。
+
+  Q：为什么 _lightmap 不是 Unity 的 Lightmap？
+  A：它是角色专属的 ILM 控制图，和 Unity 的场景烘焙 Lightmap 完全不同。
+
+  Q：为什么描边不能 Cull Off？
+  A：Cull Off 让背面和正面共用光照，背面法线方向错误，无法按材质分色。
+
+  Q：为什么法线贴图 NPR 里要克制？
+  A：强法线让阴影边界碎裂，脸部尤其容易出脏阴影，破坏动画感。
+
+  Q：为什么金属用 MatCap 不用 PBR？
+  A：MatCap 稳定、轻量、不依赖场景环境，外观由美术完全控制。
+
+  Q：为什么有 5 种描边颜色？
+  A：皮肤/布料/金属描边颜色不同，统一黑色会让皮肤显脏。
+
+  Q：为什么自发光不乘主光颜色？
+  A：自发光是物体自身产生的光，不应该被场景主光颜色影响。
+
+  Q：为什么脸部要用 SDF/FaceLightmap 而不是 NdotL？
+  A：脸部曲面复杂，NdotL 会产生鼻侧阴影、眼周黑圈等破坏性效果。
+
+================================================================================
+整合笔记 END
+整理自：Genshin_Shader_完整笔记 + 原神NPR身体Shader
+整合日期：2026-06-29
+================================================================================
