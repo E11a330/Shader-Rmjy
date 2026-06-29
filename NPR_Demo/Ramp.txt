@@ -1,6 +1,7 @@
-ramp采样理解
+    ramp采样理解
+
 Ramp 贴图的作用是把一个简单的明暗值重新映射成一套可控的风格化颜色，常用于 NPR / 卡通渲染中控制阴影色、灰部过渡和亮部表现。
-比如把 AO 参与后的明暗结果重新映射成风格化阴影颜色；除了 AO，它也可以处理主光阴影、投影阴影、接触阴影、面部 SDF 阴影、烘焙阴影等各种被转换成 0~1 遮罩的阴影
+Ramp通常对最终得到的阴影遮罩（Shadow Mask）进行重新映射，这个遮罩可能已经融合了HalfLambert、AO、SDF、ShadowMap等因素
 人话：给黑白halflanbert上色
 
 U:halflanbert值（实际中会根据风格处理halflabert达到美术要求的明暗变换）
@@ -10,13 +11,13 @@ V：lightmap.a通道值→Ramp行号的映射
                                                     这样假如ID=1，则采样的rampV是0.95
     每一个材质对应一个ramp条，分离材质用阶梯遮罩：
 
-    //利用step将每一个灰度值（材质）用四位01编码确定
+    //利用step判断每一个灰度值（材质）是否超过阈值，用四位01编码表示
     float lightmapA2 = step(0.25, lightmap.a);  //0.3
     float lightmapA3 = step(0.45, lightmap.a);  //0.5
     float lightmapA4 = step(0.65, lightmap.a);  //0.7
     float lightmapA5 = step(0.95, lightmap.a);  //1.0
 
-    //假如是1110，则rampV等于ramp3
+    //假如是1110，连续Lerp得到rampV等于ramp3
     float rampV = ramp0;
     rampV = lerp(rampV, ramp1, lightmapA2);
     rampV = lerp(rampV, ramp2, lightmapA3);
@@ -24,12 +25,13 @@ V：lightmap.a通道值→Ramp行号的映射
     rampV = lerp(rampV, ramp4, lightmapA5);
 
     这样类比，每一个灰度值都对应一个rampV
-    这时采样ramp会得到角色的上色明暗渐变，但是ramp贴图控制的时阴影，所以需要把亮面遮罩出来
+    这时采样ramp会得到角色的上色明暗渐变
+    Ramp可以覆盖整个0~1范围，但是很多二次元Shader为了让亮部保持BaseColor，不希望Ramp改变亮面颜色，所以只让Ramp作用于阴影区域。要做亮面遮罩
     
     //halfLambert等于0人话就是光照方向和模型表面平行，即不受光，阴影部分，所以半兰伯特大于某个值即为亮面，返回值亮面为1，阴影为0
     float brightMask = step(_bright, halfLambert);  //亮面
 
-    //此时亮面返回兰伯特，阴影饭返回ramp计算，整个ramp采样结束
+    //此时亮面返回最终漫反射，阴影饭返回ramp计算，整个ramp采样结束
     float3 shadowRamp = lerp(ramp, halfLambert, brightMask);  //遮罩亮面
 
 
