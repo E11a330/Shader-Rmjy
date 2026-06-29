@@ -2,7 +2,7 @@
 
 Ramp 贴图的作用是把一个简单的明暗值重新映射成一套可控的风格化颜色，常用于 NPR / 卡通渲染中控制阴影色、灰部过渡和亮部表现。
 Ramp通常对最终得到的阴影遮罩（Shadow Mask）进行重新映射，这个遮罩可能已经融合了HalfLambert、AO、SDF、ShadowMap等因素
-人话：给黑白halflanbert上色
+人话：给最终得到的黑白阴影遮罩（此例中是风格化计算过后黑白halflanbert渐变）上色
 
 U:halflanbert值（实际中会根据风格处理halflabert达到美术要求的明暗变换）
 
@@ -11,7 +11,7 @@ V：lightmap.a通道值→Ramp行号的映射
                                                     这样假如ID=1，则采样的rampV是0.95
     每一个材质对应一个ramp条，分离材质用阶梯遮罩：
 
-    //利用step判断每一个灰度值（材质）是否超过阈值，用四位01编码表示
+    //利用step判断每一个灰度值（材质）是否超过阈值，用四位01判断结果表示
     float lightmapA2 = step(0.25, lightmap.a);  //0.3
     float lightmapA3 = step(0.45, lightmap.a);  //0.5
     float lightmapA4 = step(0.65, lightmap.a);  //0.7
@@ -28,10 +28,33 @@ V：lightmap.a通道值→Ramp行号的映射
     这时采样ramp会得到角色的上色明暗渐变
     Ramp可以覆盖整个0~1范围，但是很多二次元Shader为了让亮部保持BaseColor，不希望Ramp改变亮面颜色，所以只让Ramp作用于阴影区域。要做亮面遮罩
     
-    //halfLambert等于0人话就是光照方向和模型表面平行，即不受光，阴影部分，所以半兰伯特大于某个值即为亮面，返回值亮面为1，阴影为0
+    //halfLambert等于0人话就是光照方向和模型法线方向相反，即背光，=0.5时此时方向平行，阴影区域，所以半兰伯特大于某个值即为亮面，返回值亮面为1，阴影为0
     float brightMask = step(_bright, halfLambert);  //亮面
 
     //此时亮面返回最终漫反射，阴影饭返回ramp计算，整个ramp采样结束
     float3 shadowRamp = lerp(ramp, halfLambert, brightMask);  //遮罩亮面
+
+
+
+    GPT说让我加上这一段
+原神Ramp真正控制的不是"阴影有没有"，而是"阴影是什么颜色"。
+
+光照计算负责回答：
+
+"这里有没有光？"
+
+Ramp负责回答：
+
+"这里应该是什么风格颜色？"
+
+因此：
+
+HalfLambert负责决定采样位置(U)。
+
+Material ID负责决定采样哪一条Ramp(V)。
+
+Ramp负责输出最终风格化颜色。
+
+最后再根据亮面Mask决定哪些区域采用Ramp颜色，哪些区域保持原始漫反射。
 
 
