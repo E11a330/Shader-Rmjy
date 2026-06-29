@@ -41,7 +41,7 @@ Shader "NPR/Niluo/Body"
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
-
+            
 //顶点属性结构体/顶点着色器输入            
             struct Attributes
             {

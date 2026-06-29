@@ -55,7 +55,7 @@
 
 【核心公式对比】
   PBR：最终颜色 = 物理光照公式（BRDF） × 材质参数（粗糙度、金属度等）
-  NPR：最终颜色 = Diffuse × Ramp（由光照方向选择） + 各种美术控制修正项
+  NPR：最终颜色 = BaseColor × Ramp +  specular高光 + 边缘光（此文章为fresnel原神边缘光是用的屏幕深度边缘光）+ 金属 + 自发光
 
   PBR 的光照几乎决定一切 —— 粗糙度、金属度、环境反射、菲涅尔全由物理公式驱动。
   NPR 的光照只是一个"触发器" —— 它只负责判断当前像素处于亮面还是暗面。
@@ -110,10 +110,6 @@
     基础色（Diffuse）/ Shadow Ramp 阴影 / Lightmap AO / 法线贴图细节
     风格化高光 / 金属 MatCap 反射 / Fresnel 边缘光 / 自发光（Emission）
 
-  ⚠️ 常见错误：
-    Tags{"LightMode"="Head"} 不是 URP 标准识别的 LightMode，
-    除非写了对应 Renderer Feature，否则 Pass 不会被渲染。
-    应改为：Tags{"LightMode"="UniversalForward"}
 
 ────────────────────────────────────────────────────────────────────────────────
 2.2  背面渲染 Pass（Back Face Pass）
